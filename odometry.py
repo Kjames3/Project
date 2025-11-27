@@ -29,6 +29,8 @@ class Odometry:
              'width': 1280, 'height': 720, 'fov': 100, 'id': 'Left'},
             {'type': 'sensor.camera.depth', 'x': 2.0, 'y': -0.8, 'z': 1.0, 'roll': 0.0, 'pitch': 0.0, 'yaw': -10.0,
              'width': 1280, 'height': 720, 'fov': 100, 'id': 'Depth_Left'},
+            {'type': 'sensor.lidar.ray_cast', 'x': 0.0, 'y': 0.0, 'z': 2.4, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+             'range': 50, 'channels': 32, 'points_per_second': 56000, 'upper_fov': 10.0, 'lower_fov': -30.0, 'id': 'Lidar'}
         ]
 
     def process_depth(self, image_data):
