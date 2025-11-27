@@ -44,6 +44,7 @@ python3 multi_agent_control.py
 ## Controls & Usage
 - **TAB**: Switch camera view between Agent A and Agent B.
 - **ESC** or **Ctrl+Q**: Quit the simulation.
+- **N**: Switch between sensor data types (LiDAR, Semantic LiDAR, Camera).
 
 ## Visualization
 The HUD displays a real-time overlay of the global map in the bottom-right corner:
