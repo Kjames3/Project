@@ -28,6 +28,7 @@ try:
     from pygame.locals import K_ESCAPE
     from pygame.locals import K_q
     from pygame.locals import K_TAB
+    from pygame.locals import K_n
 except ImportError:
     raise RuntimeError('cannot import pygame, make sure pygame package is installed')
 
@@ -247,6 +248,8 @@ class KeyboardControl(object):
                 elif event.key == K_TAB:
                     world.active_agent_index = (world.active_agent_index + 1) % len(world.players)
                     world.hud.notification(f"Switched to Agent {world.active_agent_index}")
+                elif event.key == K_n:
+                    world.camera_managers[world.active_agent_index].next_sensor()
 
     @staticmethod
     def _is_quit_shortcut(key):
