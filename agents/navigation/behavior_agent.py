@@ -21,6 +21,8 @@ from odometry import Odometry  # pylint: disable=import-rror
 import pdb
 
 from utils.ate import AbsoluteTrajectoryError
+from mapping import LocalMapper # Import LocalMapper
+from hybrid_planner import HybridRoutePlanner # Import HybridRoutePlanner
 
 class BehaviorAgent(BasicAgent):
     """
@@ -35,12 +37,18 @@ class BehaviorAgent(BasicAgent):
     are encoded in the agent, from cautious to a more aggressive ones.
     """
 
-    def __init__(self, vehicle, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None):
+    def __init__(self, vehicle, target_speed=20, behavior='normal', opt_dict={}, map_inst=None, grp_inst=None, fusion_server=None):
         """
-        Constructor method.
+        Initialization the agent paramters, the local and the global planner.
 
-            :param vehicle: actor to apply to local planner logic onto
-            :param behavior: type of agent to apply
+            :param vehicle: actor to apply to agent logic onto
+            :param target_speed: speed (in Km/h) at which the vehicle will move
+            :param opt_dict: dictionary in case some of its parameters want to be changed.
+                This also applies to parameters related to the LocalPlanner.
+            :param map_inst: carla.Map instance to avoid the expensive call of getting it.
+            :param grp_inst: GlobalRoutePlanner instance to avoid the expensive call of getting it.
+            :param fusion_server: FusionServer instance for cooperative planning.
+
         """
 
         super().__init__(vehicle, opt_dict=opt_dict, map_inst=map_inst, grp_inst=grp_inst)
@@ -79,6 +87,16 @@ class BehaviorAgent(BasicAgent):
         # Keep track of prev sensor data
         self.prev_sensor_data = None
 
+        # Initialize Local Mapper
+        self._local_mapper = LocalMapper(vehicle)
+        
+        # Initialize Hybrid Planner
+        self._hybrid_planner = None
+        if fusion_server:
+            self._hybrid_planner = HybridRoutePlanner(fusion_server)
+            self._check_interval = 20 # Check every 20 steps
+            self._step_count = 0
+
     def destroy(self, gt_traj, est_traj):
         ate = AbsoluteTrajectoryError(gt_traj, est_traj)
         ate.traj_err = ate.compute_trajectory_error()
@@ -99,6 +117,21 @@ class BehaviorAgent(BasicAgent):
     
     def sensors(self):  # pylint: disable=no-self-use
         sensors = self._odometry.sensors()
+        
+        # Add LiDAR for Mapping
+        sensors.append({
+            'type': 'sensor.lidar.ray_cast', 
+            'x': 0.7, 'y': 0.0, 'z': 1.60, 
+            'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
+            'range': 50, 
+            'rotation_frequency': 20, 
+            'channels': 32, 
+            'upper_fov': 10, 
+            'lower_fov': -30, 
+            'points_per_second': 56000,
+            'id': 'LIDAR'
+        })
+
         for s in sensors:
             s['x'] = s['x']*self.bound_x
             s['y'] = s['y']*self.bound_y
@@ -295,6 +328,30 @@ class BehaviorAgent(BasicAgent):
 
         # Update prev sensor data
         self.prev_sensor_data = sensor_data
+
+        # Mapping Update
+        if 'LIDAR' in sensor_data:
+            lidar_data = sensor_data['LIDAR'][1] # [timestamp, data]
+            self._local_mapper.process_lidar(lidar_data, self._vehicle.get_transform())
+
+        # Cooperative Replanning Check
+        if self._hybrid_planner:
+            self._step_count += 1
+            if self._step_count % self._check_interval == 0:
+                # Check path ahead
+                # Get next few waypoints
+                plan = self._local_planner.get_plan()
+                if plan:
+                    # Check up to 20 meters ahead
+                    start_loc = self._vehicle.get_location()
+                    # Find a waypoint ~20m ahead or last one
+                    target_loc = plan[min(len(plan)-1, 10)][0].transform.location
+                    
+                    if self._hybrid_planner.is_path_blocked(start_loc, target_loc):
+                        print(f"Agent {self._vehicle.id}: Path blocked! Stopping/Rerouting...")
+                        # Simple behavior: Emergency Stop for now
+                        # In real implementation, we would call set_destination(new_dest)
+                        hazard_detected = True
 
         # Behavior Agent Updates (Do not modify):
         
