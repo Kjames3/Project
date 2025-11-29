@@ -84,3 +84,60 @@ class HybridRoutePlanner(object):
                     return True
 
         return False
+
+    def get_frontiers(self):
+        """
+        Scans the global map to find frontiers (edges between Free and Unknown space).
+        
+        :return: List of (x, y) tuples in global coordinates representing frontier points.
+        """
+        global_map = self._fusion_server.get_global_map()
+        if global_map is None:
+            return []
+
+        # 1. Define Masks
+        # Free: < 0.4
+        # Unknown: 0.4 <= p <= 0.6
+        # Occupied: > 0.6
+        
+        free_mask = (global_map < 0.4).astype(np.uint8)
+        unknown_mask = ((global_map >= 0.4) & (global_map <= 0.6)).astype(np.uint8)
+        
+        # 2. Find Frontiers
+        # Frontier pixels are Free pixels that are adjacent to Unknown pixels.
+        # We can dilate Unknown mask and intersect with Free mask.
+        
+        import cv2
+        kernel = np.ones((3, 3), np.uint8)
+        dilated_unknown = cv2.dilate(unknown_mask, kernel, iterations=1)
+        
+        frontier_mask = (free_mask == 1) & (dilated_unknown == 1)
+        
+        # 3. Extract Coordinates
+        # Indices (r, c)
+        frontier_indices = np.argwhere(frontier_mask)
+        
+        if len(frontier_indices) == 0:
+            return []
+            
+        # Downsample if too many?
+        # Or cluster them. For now, return all (or a subset).
+        # Let's return a subset (stride) to avoid returning thousands of points.
+        # stride = 5
+        # frontier_indices = frontier_indices[::stride]
+        
+        # 4. Convert to Global Coordinates
+        # Row = (Max_X - X) / res => X = Max_X - Row * res
+        # Col = (Y - Min_Y) / res => Y = Min_Y + Col * res
+        
+        grid_size = self._fusion_server.grid_size
+        max_x = self._fusion_server.max_x
+        min_y = self._fusion_server.min_y
+        
+        frontiers = []
+        for r, c in frontier_indices:
+            x = max_x - r * grid_size
+            y = min_y + c * grid_size
+            frontiers.append((x, y))
+            
+        return frontiers
