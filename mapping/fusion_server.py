@@ -52,6 +52,9 @@ class FusionServer(object):
         self.l_free = np.log(0.4 / 0.6) # p(free) = 0.4
         self.l_max = 5.0 # Clamp
         self.l_min = -5.0 # Clamp
+        
+        # Trajectories: agent_id -> list of (x, y)
+        self.trajectories = {}
 
     def update_map(self, agent_id, local_occupancy_grid, pose):
         """
@@ -140,6 +143,22 @@ class FusionServer(object):
         
         # Clamp
         np.clip(self.log_odds_map, self.l_min, self.l_max, out=self.log_odds_map)
+
+    def update_trajectory(self, agent_id, pose):
+        """
+        Updates the trajectory history for an agent.
+        :param agent_id: ID of the agent
+        :param pose: (x, y, yaw)
+        """
+        if agent_id not in self.trajectories:
+            self.trajectories[agent_id] = []
+        
+        # Add current position
+        self.trajectories[agent_id].append((pose[0], pose[1]))
+        
+        # Limit history if needed (e.g. 10000 points)
+        if len(self.trajectories[agent_id]) > 10000:
+            self.trajectories[agent_id].pop(0)
 
     def get_global_map(self):
         """
