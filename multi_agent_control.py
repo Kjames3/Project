@@ -68,7 +68,7 @@ import carla
 from carla import ColorConverter as cc
 
 from agents.navigation.behavior_agent import BehaviorAgent  # pylint: disable=import-error
-from fusion_server import FusionServer
+from mapping.fusion_server import FusionServer
 from agents.navigation.basic_agent import BasicAgent  # pylint: disable=import-error
 
 # ==============================================================================
@@ -413,148 +413,88 @@ class HUD(object):
         self._notifications.render(display)
         self.help.render(display)
 
-    def render_global_map(self, display, fusion_server, players):
+    def render_side_map(self, display, fusion_server, players):
         """
-        Renders the global occupancy grid from the fusion server.
+        Renders the global occupancy grid and trajectories to the right side of the screen.
         """
         global_map = fusion_server.get_global_map()
         if global_map is None:
             return
 
-        # Map Settings
-        map_size_px = 200 # Size of the map on screen
-        map_surface = pygame.Surface((map_size_px, map_size_px))
+        # Surface for the Map (Same size as Camera View)
+        map_surface = pygame.Surface(self.dim)
         map_surface.fill((0, 0, 0))
-        map_surface.set_alpha(200) # Semi-transparent
-
-        # Convert Probability Map to Image
-        # global_map is (N, N) with values 0.0-1.0
-        # We want to display it.
-        # 0.0 (Free) -> Black/Dark
-        # 1.0 (Occupied) -> White/Red
-        # 0.5 (Unknown) -> Gray
         
-        # Downsample if grid is too large?
-        # Grid is 1000x1000. We want 200x200.
-        # Simple resize for visualization
+        # 1. Render Grid
+        # global_map is (N, N). We want to scale to self.dim (W, H).
+        # We should maintain aspect ratio or fill?
+        # Map is square. Screen is 16:9.
+        # Let's fit the square map into the screen (centered) or fill?
+        # Filling might distort if not square.
+        # Let's fit it to the height (since height < width usually).
+        # Or scale to cover.
+        # Let's scale to fit height, and center horizontally.
         
-        # Convert to 0-255 uint8
-        # Transpose because Pygame is (width, height) but numpy is (row, col)
-        # And row is Y? No, row is usually Y in image.
-        # In our map: Row 0 is Max X. Col 0 is Min Y.
-        # We want to draw it such that Up is Forward (X).
-        # So Row should map to Y-axis on screen (inverted).
+        scale = self.dim[1] / fusion_server.grid_dim
+        map_w = int(fusion_server.grid_dim * scale)
+        map_h = int(fusion_server.grid_dim * scale)
+        
+        offset_x = (self.dim[0] - map_w) // 2
+        offset_y = 0
         
         grid_img = (global_map * 255).astype(np.uint8)
-        
-        # Create Pygame Surface from array
-        # make_surface expects (width, height, depth) or (width, height)
-        # It maps array[x, y] to pixel (x, y).
-        # Our array is [row, col].
-        # If we want Row to be Y, and Col to be X.
-        # We should pass array[col, row] -> array.T
-        
-        # Also, our Row 0 is Max X (Top of map).
-        # Pygame Y 0 is Top of screen.
-        # So Row 0 -> Y 0 is correct for "North Up" if we view map from top.
-        
-        # But wait, our map logic:
-        # Row = (Max_X - X) / res.
-        # X=Max -> Row=0.
-        # X=Min -> Row=N.
-        # So Row 0 is Top (North).
-        # Pygame Y=0 is Top.
-        # So Row maps to Y directly.
-        
-        # Col = (Y - Min_Y) / res.
-        # Y=Min -> Col=0 (Left).
-        # Y=Max -> Col=N (Right).
-        # Pygame X=0 is Left.
-        # So Col maps to X directly.
-        
-        # So we have [Row, Col] -> [Y, X].
-        # Pygame expects [X, Y].
-        # So we need to transpose: [Col, Row].
-        
-        surf_array = np.stack([grid_img.T]*3, axis=-1) # Grayscale to RGB
-        
-        # Resize to display size
-        # We can use pygame.transform.scale
+        surf_array = np.stack([grid_img.T]*3, axis=-1)
         temp_surf = pygame.surfarray.make_surface(surf_array)
-        scaled_surf = pygame.transform.scale(temp_surf, (map_size_px, map_size_px))
+        scaled_surf = pygame.transform.scale(temp_surf, (map_w, map_h))
         
-        map_surface.blit(scaled_surf, (0, 0))
+        map_surface.blit(scaled_surf, (offset_x, offset_y))
         
-        # Draw Agents
-        # We need to map Global (X, Y) to Map Pixel (px, py)
-        # Then scale to Display Pixel.
-        
-        grid_dim = fusion_server.grid_dim
-        scale_factor = map_size_px / grid_dim
-        
+        # Helper for coordinate transform
+        def to_screen(gx, gy):
+            # Global -> Grid
+            r = (fusion_server.max_x - gx) / fusion_server.grid_size
+            c = (gy - fusion_server.min_y) / fusion_server.grid_size
+            # Grid -> Screen
+            sx = offset_x + int(c * scale)
+            sy = offset_y + int(r * scale)
+            return sx, sy
+
+        # 2. Draw Trajectories
+        for agent_id, traj in fusion_server.trajectories.items():
+            if len(traj) > 1:
+                points = [to_screen(p[0], p[1]) for p in traj]
+                # Filter points? Pygame handles clipping.
+                color = (0, 255, 255) if agent_id == 0 else (255, 0, 255)
+                pygame.draw.lines(map_surface, color, False, points, 2)
+
+        # 3. Draw Agents
         for i, player in enumerate(players):
             t = player.get_transform()
-            loc = t.location
-            yaw = t.rotation.yaw
-            
-            # Global X, Y -> Grid Row, Col
-            # Row = (Max_X - X) / res
-            # Col = (Y - Min_Y) / res
-            
-            r = (fusion_server.max_x - loc.x) / fusion_server.grid_size
-            c = (loc.y - fusion_server.min_y) / fusion_server.grid_size
-            
-            # Grid Row, Col -> Display X, Y
-            # Display X = Col * scale
-            # Display Y = Row * scale
-            
-            dx = int(c * scale_factor)
-            dy = int(r * scale_factor)
+            sx, sy = to_screen(t.location.x, t.location.y)
             
             color = (0, 0, 255) if i == 0 else (255, 0, 0)
-            pygame.draw.circle(map_surface, color, (dx, dy), 3)
+            pygame.draw.circle(map_surface, color, (sx, sy), 5)
             
-            # Draw Heading
-            # Yaw is in degrees. 0 = X axis (Right in standard math, but Forward in CARLA).
-            # CARLA: X=Forward, Y=Right, Z=Up.
-            # Yaw 0 = +X.
-            # Yaw 90 = +Y.
+            # Heading
+            rad = math.radians(t.rotation.yaw)
+            vx = math.cos(rad)
+            vy = math.sin(rad)
+            # Screen vector:
+            # x_s ~ c ~ y_g
+            # y_s ~ r ~ -x_g
+            dx = vy * 15
+            dy = -vx * 15
+            pygame.draw.line(map_surface, (255, 255, 0), (sx, sy), (sx + dx, sy + dy), 2)
             
-            # On our map:
-            # Up is +X. Right is +Y.
-            # So Yaw 0 should point Up.
-            # Yaw 90 should point Right.
-            
-            # Pygame angles: 0 is Right? No, usually standard trig.
-            # But we are drawing lines.
-            
-            # We want a vector (vx, vy) in Display coords.
-            # Display X is +Y (Global).
-            # Display Y is -X (Global) (since Row increases as X decreases).
-            
-            # Global Vector:
-            # vx_g = cos(yaw)
-            # vy_g = sin(yaw)
-            
-            # Display Vector:
-            # dx_d = vy_g  (since Col ~ Y)
-            # dy_d = -vx_g (since Row ~ -X)
-            
-            rad = math.radians(yaw)
-            vx_g = math.cos(rad)
-            vy_g = math.sin(rad)
-            
-            dx_d = vy_g * 10
-            dy_d = -vx_g * 10
-            
-            pygame.draw.line(map_surface, (255, 255, 0), (dx, dy), (dx + dx_d, dy + dy_d), 1)
+            # Label
+            label = self._font_mono.render(f"A{i}", True, (255, 255, 255))
+            map_surface.blit(label, (sx + 10, sy - 10))
 
-        # Blit map to main display (Bottom Right)
-        display.blit(map_surface, (self.dim[0] - map_size_px - 10, self.dim[1] - map_size_px - 10))
+        # Blit to Right Side of Main Display
+        display.blit(map_surface, (self.dim[0], 0))
         
-        # Draw Border
-        pygame.draw.rect(display, (255, 255, 255), 
-                         (self.dim[0] - map_size_px - 10, self.dim[1] - map_size_px - 10, map_size_px, map_size_px), 1)
+        # Draw Separator
+        pygame.draw.line(display, (255, 255, 255), (self.dim[0], 0), (self.dim[0], self.dim[1]), 2)
 
 # ==============================================================================
 # -- FadingText ----------------------------------------------------------------
@@ -753,21 +693,23 @@ class CameraManager(object):
             (carla.Transform(carla.Location(x=+1.9*bound_x, y=+1.0*bound_y, z=1.2*bound_z)), attachment.SpringArmGhost),
             (carla.Transform(carla.Location(x=-2.8*bound_x, y=+0.0*bound_y, z=4.6*bound_z), carla.Rotation(pitch=6.0)), attachment.SpringArmGhost),
             (carla.Transform(carla.Location(x=-1.0, y=-1.0*bound_y, z=0.4*bound_z)), attachment.Rigid),
+            (carla.Transform(carla.Location(x=-5.0, z=2.5), carla.Rotation(pitch=-10.0)), attachment.SpringArmGhost),
             ]
 
         self.transform_index = 1
         self.sensors = [
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB'],
-            ['sensor.camera.depth', cc.Raw, 'Camera Depth (Raw)'],
-            ['sensor.camera.depth', cc.Depth, 'Camera Depth (Gray Scale)'],
-            ['sensor.camera.depth', cc.LogarithmicDepth, 'Camera Depth (Logarithmic Gray Scale)'],
             ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)'],
             ['sensor.camera.semantic_segmentation', cc.CityScapesPalette,
              'Camera Semantic Segmentation (CityScapes Palette)'],
-            ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)']]
+            ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)'],
+            ['virtual_bev_map', None, 'Occupancy Grid Map']]
         world = self._parent.get_world()
         bp_library = world.get_blueprint_library()
         for item in self.sensors:
+            if item[0] == 'virtual_bev_map':
+                item.append(None)
+                continue
             blp = bp_library.find(item[0])
             if item[0].startswith('sensor.camera'):
                 blp.set_attribute('image_size_x', str(hud.dim[0]))
@@ -791,15 +733,19 @@ class CameraManager(object):
             if self.sensor is not None:
                 self.sensor.destroy()
                 self.surface = None
-            self.sensor = self._parent.get_world().spawn_actor(
-                self.sensors[index][-1],
-                self._camera_transforms[self.transform_index][0],
-                attach_to=self._parent,
-                attachment_type=self._camera_transforms[self.transform_index][1])
-            # We need to pass the lambda a weak reference to
-            # self to avoid circular reference.
-            weak_self = weakref.ref(self)
-            self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
+            
+            if self.sensors[index][0] == 'virtual_bev_map':
+                self.sensor = None
+            else:
+                self.sensor = self._parent.get_world().spawn_actor(
+                    self.sensors[index][-1],
+                    self._camera_transforms[self.transform_index][0],
+                    attach_to=self._parent,
+                    attachment_type=self._camera_transforms[self.transform_index][1])
+                # We need to pass the lambda a weak reference to
+                # self to avoid circular reference.
+                weak_self = weakref.ref(self)
+                self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
         if notify:
             self.hud.notification(self.sensors[index][2])
         self.index = index
@@ -865,7 +811,7 @@ def game_loop(args):
         client.set_timeout(20.0)
 
         display = pygame.display.set_mode(
-            (args.width, args.height),
+            (args.width * 2, args.height),
             pygame.HWSURFACE | pygame.DOUBLEBUF)
 
         hud = HUD(args.width, args.height)
@@ -898,20 +844,77 @@ def game_loop(args):
 
             # Asynchronous update
             world.tick(clock)
+            
+            # Update Virtual Sensor (BEV Map) if active
+            cm = world.camera_managers[world.active_agent_index]
+            if cm.sensors[cm.index][0] == 'virtual_bev_map':
+                # Render map to camera surface
+                # Reuse render_global_map logic but scale to full screen?
+                # Or just use the existing render_global_map but blit to cm.surface
+                
+                # Create surface if None
+                if cm.surface is None:
+                    cm.surface = pygame.Surface((args.width, args.height))
+                
+                # Fill black
+                cm.surface.fill((0,0,0))
+                
+                # Render map
+                # We can call a helper or just do it here.
+                # Let's use a simplified version of render_global_map that fills the screen.
+                global_map = fusion_server.get_global_map()
+                if global_map is not None:
+                    grid_img = (global_map * 255).astype(np.uint8)
+                    surf_array = np.stack([grid_img.T]*3, axis=-1)
+                    temp_surf = pygame.surfarray.make_surface(surf_array)
+                    scaled_surf = pygame.transform.scale(temp_surf, (args.width, args.height))
+                    cm.surface.blit(scaled_surf, (0, 0))
+                    
+                    # Draw Agents on top
+                    # Scale factor
+                    scale_factor = args.width / fusion_server.grid_dim # Assuming square aspect ratio
+                    
+                    for idx, player in enumerate(world.players):
+                        t = player.get_transform()
+                        loc = t.location
+                        yaw = t.rotation.yaw
+                        
+                        r = (fusion_server.max_x - loc.x) / fusion_server.grid_size
+                        c = (loc.y - fusion_server.min_y) / fusion_server.grid_size
+                        
+                        dx = int(c * scale_factor)
+                        dy = int(r * scale_factor)
+                        
+                        color = (0, 0, 255) if idx == 0 else (255, 0, 0)
+                        pygame.draw.circle(cm.surface, color, (dx, dy), 5)
+                        
+                        rad = math.radians(yaw)
+                        vx_g = math.cos(rad)
+                        vy_g = math.sin(rad)
+                        dx_d = vy_g * 15
+                        dy_d = -vx_g * 15
+                        pygame.draw.line(cm.surface, (255, 255, 0), (dx, dy), (dx + dx_d, dy + dy_d), 2)
+
             world.render(display)
             
             # Render Global Map
-            world.hud.render_global_map(display, fusion_server, world.players)
+            # Render Side Map (Right Side)
+            world.hud.render_side_map(display, fusion_server, world.players)
             
             pygame.display.flip()
 
             # Control Loop for Agents
             for i, agent in enumerate(agents):
-                if agent.done():
-                    # Pick a new random destination
-                    spawn_points = world.map.get_spawn_points()
-                    agent.set_destination(random.choice(spawn_points).location)
-                    print(f"Agent {i} reached destination, rerouting...")
+                if agent.done() or agent.is_stuck():
+                    if agent.is_stuck():
+                        print(f"Agent {i} is stuck! Rerouting...")
+                    
+                    # Try to reroute to frontier
+                    if not agent.reroute_to_frontier():
+                        # Pick a new random destination if no frontier or failed
+                        spawn_points = world.map.get_spawn_points()
+                        agent.set_destination(random.choice(spawn_points).location)
+                        print(f"Agent {i} random rerouting...")
                 
                 control = agent.run_step()
                 control.manual_gear_shift = False
@@ -926,6 +929,9 @@ def game_loop(args):
                     pose = (t.location.x, t.location.y, t.rotation.yaw)
                     
                     fusion_server.update_map(i, local_map, pose)
+                    
+                    # Update Trajectory
+                    fusion_server.update_trajectory(i, pose)
     finally:
         if world is not None:
             world.destroy()
@@ -980,9 +986,11 @@ def main():
         help='Choose one of the possible agent behaviors (default: normal) ',
         default='normal')
     argparser.add_argument(
-        '--sync',
-        action='store_true',
-        help='Synchronous mode execution')
+        '--async',
+        action='store_false',
+        dest='sync',
+        help='Use asynchronous mode execution')
+    argparser.set_defaults(sync=True)
     args = argparser.parse_args()
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
