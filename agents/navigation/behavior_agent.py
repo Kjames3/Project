@@ -11,6 +11,7 @@ traffic signs, and has different possible configurations. """
 import random
 import numpy as np
 import carla
+import math
 from agents.navigation.basic_agent import BasicAgent
 from agents.navigation.local_planner import RoadOption
 from agents.navigation.behavior_types import Cautious, Aggressive, Normal
@@ -21,7 +22,7 @@ from odometry import Odometry  # pylint: disable=import-rror
 import pdb
 
 from utils.ate import AbsoluteTrajectoryError
-from mapping import LocalMapper # Import LocalMapper
+from mapping.occupancy_grid import LocalMapper # Import LocalMapper
 from hybrid_planner import HybridRoutePlanner # Import HybridRoutePlanner
 
 class BehaviorAgent(BasicAgent):
@@ -50,6 +51,27 @@ class BehaviorAgent(BasicAgent):
             :param fusion_server: FusionServer instance for cooperative planning.
 
         """
+
+        # PID Controller Tuning
+        if 'lateral_control_dict' not in opt_dict:
+            opt_dict['lateral_control_dict'] = {
+                'K_P': 1.0,
+                'K_D': 0.05,
+                'K_I': 0.07,
+                'dt': 0.05
+            }
+        if 'longitudinal_control_dict' not in opt_dict:
+            opt_dict['longitudinal_control_dict'] = {
+                'K_P': 1.0,
+                'K_D': 0.0,
+                'K_I': 0.05,
+                'dt': 0.05
+            }
+        
+        # Ensure traffic rules are respected
+        opt_dict['ignore_traffic_lights'] = False
+        opt_dict['ignore_stop_signs'] = False
+        opt_dict['ignore_vehicles'] = False
 
         super().__init__(vehicle, opt_dict=opt_dict, map_inst=map_inst, grp_inst=grp_inst)
         self._look_ahead_steps = 0
@@ -96,6 +118,11 @@ class BehaviorAgent(BasicAgent):
             self._hybrid_planner = HybridRoutePlanner(fusion_server)
             self._check_interval = 20 # Check every 20 steps
             self._step_count = 0
+            
+        # Stuck Detection
+        self._stuck_timer = 0
+        self._last_location = None
+        self._stuck_threshold = 100 # steps (approx 5s)
 
     def destroy(self, gt_traj, est_traj):
         ate = AbsoluteTrajectoryError(gt_traj, est_traj)
@@ -118,9 +145,9 @@ class BehaviorAgent(BasicAgent):
     def sensors(self):  # pylint: disable=no-self-use
         sensors = self._odometry.sensors()
         
-        # Add LiDAR for Mapping
+        # Add Semantic LiDAR for Mapping
         sensors.append({
-            'type': 'sensor.lidar.ray_cast', 
+            'type': 'sensor.lidar.ray_cast_semantic', 
             'x': 0.7, 'y': 0.0, 'z': 1.60, 
             'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
             'range': 50, 
@@ -321,6 +348,7 @@ class BehaviorAgent(BasicAgent):
             :return control: carla.VehicleControl
         """
         # SLAM (Modify as needed)
+        self._update_stuck_status()
         sensor_data = self.get_sensor_data()
 
         # Update latest estimated pose
@@ -415,6 +443,26 @@ class BehaviorAgent(BasicAgent):
             control = self._local_planner.run_step(debug=debug)
 
         return control
+        
+    def is_stuck(self):
+        """
+        Checks if the agent is stuck.
+        :return: True if stuck, False otherwise
+        """
+        return self._stuck_timer > self._stuck_threshold
+
+    def _update_stuck_status(self):
+        """
+        Updates the stuck timer based on movement.
+        """
+        current_loc = self._vehicle.get_location()
+        if self._last_location:
+            dist = current_loc.distance(self._last_location)
+            if dist < 0.1: # Not moving much
+                self._stuck_timer += 1
+            else:
+                self._stuck_timer = 0
+        self._last_location = current_loc
 
     def emergency_stop(self):
         """
@@ -428,3 +476,53 @@ class BehaviorAgent(BasicAgent):
         control.brake = self._max_brake
         control.hand_brake = False
         return control
+
+    def reroute_to_frontier(self):
+        """
+        Reroutes the agent to the nearest frontier point.
+        :return: True if successful, False otherwise
+        """
+        if not self._hybrid_planner:
+            return False
+            
+        frontiers = self._hybrid_planner.get_frontiers()
+        if not frontiers:
+            return False
+            
+        # Find nearest frontier
+        ego_loc = self._vehicle.get_location()
+        min_dist = float('inf')
+        best_frontier = None
+        
+        for fx, fy in frontiers:
+            dist = math.sqrt((ego_loc.x - fx)**2 + (ego_loc.y - fy)**2)
+            
+            # Filter frontiers too close (prevent loops)
+            if dist < 5.0:
+                continue
+                
+            if dist < min_dist:
+                min_dist = dist
+                best_frontier = (fx, fy)
+                
+        if best_frontier:
+            # Convert to Location
+            # Use ego Z for simplicity, or 0
+            target_loc = carla.Location(x=best_frontier[0], y=best_frontier[1], z=ego_loc.z)
+            
+            print(f"Agent {self._vehicle.id}: Rerouting to frontier at ({best_frontier[0]:.1f}, {best_frontier[1]:.1f})")
+            
+            # Snap to Road Network
+            # Find nearest waypoint on the road
+            try:
+                wp = self._map.get_waypoint(target_loc, project_to_road=True, lane_type=carla.LaneType.Driving)
+                if wp:
+                    target_loc = wp.transform.location
+                    print(f"Agent {self._vehicle.id}: Snapped to road at ({target_loc.x:.1f}, {target_loc.y:.1f})")
+            except Exception as e:
+                print(f"Agent {self._vehicle.id}: Failed to snap to road: {e}")
+            
+            self.set_destination(target_loc)
+            return True
+            
+        return False
