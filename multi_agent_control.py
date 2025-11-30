@@ -423,18 +423,32 @@ class HUD(object):
 
         # Surface for the Map (Same size as Camera View)
         map_surface = pygame.Surface(self.dim)
-        map_surface.fill((0, 0, 0))
+        map_surface.fill((50, 50, 50)) # Default Gray (Unknown)
         
         # 1. Render Grid
-        # global_map is (N, N). We want to scale to self.dim (W, H).
-        # We should maintain aspect ratio or fill?
-        # Map is square. Screen is 16:9.
-        # Let's fit the square map into the screen (centered) or fill?
-        # Filling might distort if not square.
-        # Let's fit it to the height (since height < width usually).
-        # Or scale to cover.
-        # Let's scale to fit height, and center horizontally.
+        # Create RGB image buffer
+        h, w = global_map.shape
+        rgb_map = np.zeros((h, w, 3), dtype=np.uint8)
         
+        # Color Scheme
+        # Unknown (approx 0.5) -> Gray (50, 50, 50)
+        unknown_mask = (global_map > 0.45) & (global_map < 0.55)
+        rgb_map[unknown_mask] = [50, 50, 50]
+        
+        # Free (< 0.45) -> Black (0, 0, 0)
+        free_mask = global_map <= 0.45
+        rgb_map[free_mask] = [0, 0, 0]
+        
+        # Occupied (>= 0.55) -> White (255, 255, 255)
+        occ_mask = global_map >= 0.55
+        rgb_map[occ_mask] = [255, 255, 255]
+        
+        # Create Pygame Surface
+        # Pygame expects (W, H, 3) but numpy is (H, W, 3). Swap axes.
+        surf_array = rgb_map.swapaxes(0, 1)
+        temp_surf = pygame.surfarray.make_surface(surf_array)
+        
+        # Scale to fit
         scale = self.dim[1] / fusion_server.grid_dim
         map_w = int(fusion_server.grid_dim * scale)
         map_h = int(fusion_server.grid_dim * scale)
@@ -442,11 +456,7 @@ class HUD(object):
         offset_x = (self.dim[0] - map_w) // 2
         offset_y = 0
         
-        grid_img = (global_map * 255).astype(np.uint8)
-        surf_array = np.stack([grid_img.T]*3, axis=-1)
-        temp_surf = pygame.surfarray.make_surface(surf_array)
         scaled_surf = pygame.transform.scale(temp_surf, (map_w, map_h))
-        
         map_surface.blit(scaled_surf, (offset_x, offset_y))
         
         # Helper for coordinate transform
@@ -836,12 +846,16 @@ def game_loop(args):
             agents.append(agent)
 
         clock = pygame.time.Clock()
+        frame_count = 0
+        MAPPING_FREQUENCY = 5
+        VISUALIZATION_FREQUENCY = 10
 
         while True:
             clock.tick_busy_loop(60)
             if controller.parse_events(world):
                 return
 
+            frame_count += 1
             # Asynchronous update
             world.tick(clock)
             
@@ -899,7 +913,8 @@ def game_loop(args):
             
             # Render Global Map
             # Render Side Map (Right Side)
-            world.hud.render_side_map(display, fusion_server, world.players)
+            if frame_count % VISUALIZATION_FREQUENCY == 0:
+                world.hud.render_side_map(display, fusion_server, world.players)
             
             pygame.display.flip()
 
@@ -928,7 +943,8 @@ def game_loop(args):
                     t = world.players[i].get_transform()
                     pose = (t.location.x, t.location.y, t.rotation.yaw)
                     
-                    fusion_server.update_map(i, local_map, pose)
+                    if frame_count % MAPPING_FREQUENCY == 0:
+                        fusion_server.update_map(i, local_map, pose)
                     
                     # Update Trajectory
                     fusion_server.update_trajectory(i, pose)
