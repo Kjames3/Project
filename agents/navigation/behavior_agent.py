@@ -55,9 +55,9 @@ class BehaviorAgent(BasicAgent):
         # PID Controller Tuning
         if 'lateral_control_dict' not in opt_dict:
             opt_dict['lateral_control_dict'] = {
-                'K_P': 1.0,
+                'K_P': 0.6,
                 'K_D': 0.05,
-                'K_I': 0.07,
+                'K_I': 0.05,
                 'dt': 0.05
             }
         if 'longitudinal_control_dict' not in opt_dict:
@@ -177,7 +177,7 @@ class BehaviorAgent(BasicAgent):
         if self._direction is None:
             self._direction = RoadOption.LANEFOLLOW
 
-        self._look_ahead_steps = int((self._speed_limit) / 10)
+        self._look_ahead_steps = max(5, int((self._speed_limit) / 10))
 
         self._incoming_waypoint, self._incoming_direction = self._local_planner.get_incoming_waypoint_and_direction(
             steps=self._look_ahead_steps)
