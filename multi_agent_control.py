@@ -67,7 +67,8 @@ except IndexError:
 import carla
 from carla import ColorConverter as cc
 
-from agents.navigation.behavior_agent import BehaviorAgent  # pylint: disable=import-error
+from agents.navigation.behavior_agent import BehaviorAgent
+from agents.navigation.sensor_interface import CallBack # Import CallBack  # pylint: disable=import-error
 from mapping.fusion_server import FusionServer
 from agents.navigation.basic_agent import BasicAgent  # pylint: disable=import-error
 
@@ -829,10 +830,11 @@ def game_loop(args):
         controller = KeyboardControl(world)
 
         # Initialize Fusion Server
-        fusion_server = FusionServer()
+        fusion_server = FusionServer(map_dim=1000)
 
         # Create Agents
         agents = []
+        sensor_list = [] # Keep track of sensors to destroy
         for player in world.players:
             agent = BehaviorAgent(player, behavior=args.behavior, fusion_server=fusion_server)
             # Set destination to a random spawn point
@@ -843,7 +845,39 @@ def game_loop(args):
             else:
                 destination = spawn_points[1].location
             agent.set_destination(destination)
+            agent.set_destination(destination)
             agents.append(agent)
+            
+            # Setup Sensors (LiDAR)
+            # BehaviorAgent defines sensors() but doesn't spawn them automatically.
+            for sensor_spec in agent.sensors():
+                if sensor_spec['type'].startswith('sensor.lidar'):
+                    bp = world.world.get_blueprint_library().find(sensor_spec['type'])
+                    bp.set_attribute('range', str(sensor_spec['range']))
+                    bp.set_attribute('rotation_frequency', str(sensor_spec['rotation_frequency']))
+                    bp.set_attribute('channels', str(sensor_spec['channels']))
+                    bp.set_attribute('upper_fov', str(sensor_spec['upper_fov']))
+                    bp.set_attribute('lower_fov', str(sensor_spec['lower_fov']))
+                    bp.set_attribute('points_per_second', str(sensor_spec['points_per_second']))
+                    
+                    # Adjust position relative to vehicle
+                    # Note: sensor_spec x/y/z are already scaled by bound_x/y/z in BehaviorAgent.sensors()
+                    # But wait, BehaviorAgent.sensors() returns scaled values?
+                    # Yes: s['x'] = s['x']*self.bound_x
+                    
+                    location = carla.Location(x=sensor_spec['x'], y=sensor_spec['y'], z=sensor_spec['z'])
+                    transform = carla.Transform(location)
+                    
+                    sensor = world.world.spawn_actor(bp, transform, attach_to=player)
+                    sensor_list.append(sensor)
+                    
+                    sensor_list.append(sensor)
+                    
+                    # Register callback using CallBack class
+                    # This handles parsing and registration with SensorInterface
+                    cb = CallBack(sensor_spec['id'], sensor, agent.sensor_interface)
+                    sensor.listen(cb)
+                    print(f"Spawned LiDAR for Agent {player.id}")
 
         clock = pygame.time.Clock()
         frame_count = 0
@@ -950,6 +984,24 @@ def game_loop(args):
                     fusion_server.update_trajectory(i, pose)
     finally:
         if world is not None:
+            # --- NEW: REPORT GENERATION ---
+            print("\n" + "="*40)
+            print("SIMULATION FINISHED: GENERATING REPORT")
+            print("="*40)
+
+            # 1. Calculate Stats
+            if 'fusion_server' in locals():
+                area = fusion_server.calculate_coverage()
+                print(f"Total Area Mapped: {area:.2f} square meters")
+
+                # 2. Save Map
+                fusion_server.save_map_to_disk("mission_report_map.png")
+
+            # 3. Clean up
+            print("Cleaning up sensors...")
+            for sensor in sensor_list:
+                if sensor is not None and sensor.is_alive:
+                    sensor.destroy()
             world.destroy()
 
         pygame.quit()
