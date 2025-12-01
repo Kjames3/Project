@@ -214,7 +214,7 @@ class BasicAgent(object):
     def get_sensor_data(self):
         return self.sensor_interface.get_data()
 
-    def run_step(self):
+    def run_step(self, debug=False, dt=None):
         """Execute one step of navigation."""
         hazard_detected = False
 
@@ -235,7 +235,7 @@ class BasicAgent(object):
         if affected_by_tlight:
             hazard_detected = True
 
-        control = self._local_planner.run_step()
+        control = self._local_planner.run_step(debug=debug, dt=dt)
         if hazard_detected:
             control = self.add_emergency_stop(control)
 
