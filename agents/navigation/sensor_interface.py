@@ -53,6 +53,8 @@ class CallBack(object):
             self._parse_image_cb(data, self._tag)
         elif isinstance(data, carla.LidarMeasurement):
             self._parse_lidar_cb(data, self._tag)
+        elif isinstance(data, carla.SemanticLidarMeasurement):
+            self._parse_semantic_lidar_cb(data, self._tag)
         elif isinstance(data, carla.RadarMeasurement):
             self._parse_radar_cb(data, self._tag)
         elif isinstance(data, carla.GnssMeasurement):
@@ -80,6 +82,14 @@ class CallBack(object):
         points = copy.deepcopy(points)
         points = np.reshape(points, (int(points.shape[0] / 4), 4))
         self._data_provider.update_sensor(tag, points, lidar_data.frame)
+
+    def _parse_semantic_lidar_cb(self, lidar_data, tag):
+        """
+        parses semantic lidar sensors
+        """
+        # LocalMapper expects the raw CARLA object to access .raw_data
+        # So we pass it through directly.
+        self._data_provider.update_sensor(tag, lidar_data, lidar_data.frame)
 
     def _parse_radar_cb(self, radar_data, tag):
         """

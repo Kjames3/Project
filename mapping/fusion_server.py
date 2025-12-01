@@ -10,6 +10,7 @@ Fusion Server for Multi-Agent Cooperative Perception
 """
 
 import numpy as np
+import cv2
 
 class FusionServer(object):
     """
@@ -113,6 +114,12 @@ class FusionServer(object):
             X_global = x_veh * cos_a - y_veh * sin_a + gx
             Y_global = x_veh * sin_a + y_veh * cos_a + gy
             
+            # DEBUG: Check ranges
+            # if len(X_global) > 0:
+            #      print(f"Global Range X: [{np.min(X_global):.2f}, {np.max(X_global):.2f}], Y: [{np.min(Y_global):.2f}, {np.max(Y_global):.2f}]")
+            #      print(f"Map Bounds X: [{self.min_x}, {self.max_x}], Y: [{self.min_y}, {self.max_y}]")
+            #      print(f"Agent Pose: {pose}")
+            
             # 3. Global Frame -> Global Grid Indices
             # Row = (Max_X - X_global) / res
             # Col = (Y_global - Min_Y) / res
@@ -134,6 +141,10 @@ class FusionServer(object):
             # Or just simple add.
             # np.add.at allows handling duplicate indices correctly if multiple local cells map to same global cell
             np.add.at(self.log_odds_map, (valid_r, valid_c), update_val)
+            
+            # DEBUG
+            if len(valid_r) > 0:
+                print(f"Agent {agent_id}: Updated {len(valid_r)} cells. Val: {update_val}")
 
         # Process Free
         transform_indices(free_indices, is_occupied=False)
@@ -167,4 +178,35 @@ class FusionServer(object):
         :return: 2D numpy array representing the global occupancy grid (0.0-1.0)
         """
         # Sigmoid: p = 1 / (1 + exp(-l))
+        # Sigmoid: p = 1 / (1 + exp(-l))
         return 1.0 / (1.0 + np.exp(-self.log_odds_map))
+
+    def calculate_coverage(self):
+        """Calculates mapped area in square meters"""
+        # Count cells that are NOT unknown (approx 0.5)
+        # We assume anything < 0.45 or > 0.55 has been 'seen'
+        probs = self.get_global_map()
+        mapped_cells = np.count_nonzero((probs < 0.45) | (probs > 0.55))
+        
+        # Area = cells * (resolution^2)
+        area_m2 = mapped_cells * (self.grid_size * self.grid_size)
+        return area_m2
+
+    def save_map_to_disk(self, filename="final_map.png"):
+        """Saves the current map as an image"""
+        probs = self.get_global_map()
+        
+        # Convert to 0-255 image
+        # Free (Low Prob) -> 255 (White)
+        # Occupied (High Prob) -> 0 (Black)
+        # Unknown -> 127 (Gray)
+        
+        image = np.full(probs.shape, 127, dtype=np.uint8)
+        image[probs < 0.45] = 255 # Free is White
+        image[probs > 0.55] = 0   # Occupied is Black
+        
+        # Flip to match visualization if needed
+        # image = cv2.flip(image, 0)
+        
+        cv2.imwrite(filename, image)
+        print(f"Map saved to {filename}")

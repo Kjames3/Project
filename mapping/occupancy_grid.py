@@ -74,7 +74,13 @@ class LocalMapper(object):
         
         valid_r = px_r[valid_mask]
         valid_c = px_c[valid_mask]
+        valid_r = px_r[valid_mask]
+        valid_c = px_c[valid_mask]
         valid_tags = tags[valid_mask]
+        
+        # DEBUG
+        # if len(points) > 0:
+        #     print(f"LocalMapper: {len(points)} points. Valid: {len(valid_r)}")
         
         # 1. Ray Casting for Free Space
         # We raycast to ALL valid points (Ground, Obstacles, Dynamic) to clear the path.
