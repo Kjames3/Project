@@ -220,12 +220,13 @@ class LocalPlanner(object):
         """Sets an offset for the vehicle"""
         self._vehicle_controller.set_offset(offset)
 
-    def run_step(self, debug=False):
+    def run_step(self, debug=False, dt=None):
         """
         Execute one step of local planning which involves running the longitudinal and lateral PID controllers to
         follow the waypoints trajectory.
 
         :param debug: boolean flag to activate waypoints debugging
+        :param dt: time differential in seconds
         :return: control to be applied
         """
         if self._follow_speed_limits:
@@ -248,7 +249,16 @@ class LocalPlanner(object):
             else:
                 min_distance = self._min_distance
 
-            if veh_location.distance(waypoint.transform.location) < min_distance:
+            # Check distance
+            dist = veh_location.distance(waypoint.transform.location)
+            
+            # Check if waypoint is behind us (dot product)
+            # This prevents looping if we missed the waypoint but are close
+            v_vec = self._vehicle.get_transform().get_forward_vector()
+            w_vec = waypoint.transform.location - veh_location
+            dot = v_vec.x * w_vec.x + v_vec.y * w_vec.y
+            
+            if dist < min_distance or (dot < 0 and dist < 10.0):
                 num_waypoint_removed += 1
             else:
                 break
@@ -267,7 +277,7 @@ class LocalPlanner(object):
             control.manual_gear_shift = False
         else:
             self.target_waypoint, self.target_road_option = self._waypoints_queue[0]
-            control = self._vehicle_controller.run_step(self._target_speed, self.target_waypoint)
+            control = self._vehicle_controller.run_step(self._target_speed, self.target_waypoint, dt=dt)
 
         if debug:
             draw_waypoints(self._vehicle.get_world(), [self.target_waypoint], 1.0)

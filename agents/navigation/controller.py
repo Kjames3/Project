@@ -51,7 +51,7 @@ class VehiclePIDController():
         self._lon_controller = PIDLongitudinalController(self._vehicle, **args_longitudinal)
         self._lat_controller = PIDLateralController(self._vehicle, offset, **args_lateral)
 
-    def run_step(self, target_speed, waypoint):
+    def run_step(self, target_speed, waypoint, dt=None):
         """
         Execute one step of control invoking both lateral and longitudinal
         PID controllers to reach a target waypoint
@@ -59,8 +59,12 @@ class VehiclePIDController():
 
             :param target_speed: desired vehicle speed
             :param waypoint: target location encoded as a waypoint
+            :param dt: time differential in seconds
             :return: distance (in meters) to the waypoint
         """
+        if dt is not None:
+            self._lon_controller._dt = dt
+            self._lat_controller._dt = dt
 
         acceleration = self._lon_controller.run_step(target_speed)
         current_steering = self._lat_controller.run_step(waypoint)
