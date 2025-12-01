@@ -113,7 +113,6 @@ class BehaviorAgent(BasicAgent):
         self._local_mapper = LocalMapper(vehicle)
         
         # Initialize Hybrid Planner
-        self._hybrid_planner = None
         if fusion_server:
             self._hybrid_planner = HybridRoutePlanner(fusion_server)
             self._check_interval = 20 # Check every 20 steps
@@ -122,7 +121,7 @@ class BehaviorAgent(BasicAgent):
         # Stuck Detection
         self._stuck_timer = 0
         self._last_location = None
-        self._stuck_threshold = 100 # steps (approx 5s)
+        self._stuck_threshold = 400 # steps (approx 20s)
 
     def destroy(self, gt_traj, est_traj):
         ate = AbsoluteTrajectoryError(gt_traj, est_traj)
@@ -177,7 +176,7 @@ class BehaviorAgent(BasicAgent):
         if self._direction is None:
             self._direction = RoadOption.LANEFOLLOW
 
-        self._look_ahead_steps = max(5, int((self._speed_limit) / 10))
+        self._look_ahead_steps = max(10, int((self._speed_limit) / 10))
 
         self._incoming_waypoint, self._incoming_direction = self._local_planner.get_incoming_waypoint_and_direction(
             steps=self._look_ahead_steps)
@@ -348,8 +347,111 @@ class BehaviorAgent(BasicAgent):
             :return control: carla.VehicleControl
         """
         # SLAM (Modify as needed)
-        self._update_stuck_status()
+        # self._update_stuck_status() # Moved to end of run_step
         sensor_data = self.get_sensor_data()
+
+        # Update latest estimated pose
+        self.latest_pose = self._odometry.get_pose(sensor_data, self.prev_sensor_data)
+
+        # Update prev sensor data
+        self.prev_sensor_data = sensor_data
+
+        # Mapping Update
+        if 'LIDAR' in sensor_data:
+            lidar_data = sensor_data['LIDAR'][1] # [timestamp, data]
+            self._local_mapper.process_lidar(lidar_data, self._vehicle.get_transform())
+
+        # Cooperative Replanning Check
+        if self._hybrid_planner:
+            self._step_count += 1
+            if self._step_count % self._check_interval == 0:
+                # Check path ahead
+                # Get next few waypoints
+                plan = self._local_planner.get_plan()
+                if plan:
+                    # Check up to 20 meters ahead
+                    start_loc = self._vehicle.get_location()
+                    # Find a waypoint ~20m ahead or last one
+                    target_loc = plan[min(len(plan)-1, 10)][0].transform.location
+                    
+                    if self._hybrid_planner.is_path_blocked(start_loc, target_loc):
+                        print(f"Agent {self._vehicle.id}: Path blocked! Stopping/Rerouting...")
+                        # Simple behavior: Emergency Stop for now
+                        # In real implementation, we would call set_destination(new_dest)
+                        hazard_detected = True
+
+        # Behavior Agent Updates (Do not modify):
+        
+        self._update_information()
+
+        control = None
+        if self._behavior.tailgate_counter > 0:
+            self._behavior.tailgate_counter -= 1
+
+        ego_vehicle_loc = self._vehicle.get_location()
+        ego_vehicle_wp = self._map.get_waypoint(ego_vehicle_loc)
+
+        # 1: Red lights and stops behavior
+        if self.traffic_light_manager():
+            self._update_stuck_status(True)
+            return self.emergency_stop()
+
+        # 2.1: Pedestrian avoidance behaviors
+        walker_state, walker, w_distance = self.pedestrian_avoid_manager(ego_vehicle_wp)
+
+        if walker_state:
+            # Distance is computed from the center of the two cars,
+            # we use bounding boxes to calculate the actual distance
+            distance = w_distance - max(
+                walker.bounding_box.extent.y, walker.bounding_box.extent.x) - max(
+                    self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
+
+            # Emergency brake if the car is very close.
+            if distance < self._behavior.braking_distance:
+                self._update_stuck_status(True)
+                return self.emergency_stop()
+
+        # 2.2: Car following behaviors
+        vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
+
+        if vehicle_state:
+            # Distance is computed from the center of the two cars,
+            # we use bounding boxes to calculate the actual distance
+            distance = distance - max(
+                vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
+                    self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
+
+            # Emergency brake if the car is very close.
+            if distance < self._behavior.braking_distance:
+                self._update_stuck_status(True)
+                return self.emergency_stop()
+            else:
+                control = self.car_following_manager(vehicle, distance)
+
+        # 3: Intersection behavior
+        elif self._incoming_waypoint.is_junction and (self._incoming_direction in [RoadOption.LEFT, RoadOption.RIGHT]):
+            target_speed = min([
+                self._behavior.max_speed,
+                self._speed_limit - 5])
+            self._local_planner.set_speed(target_speed)
+            control = self._local_planner.run_step(debug=debug)
+
+        # 4: Normal behavior
+        else:
+            target_speed = min([
+                self._behavior.max_speed,
+                self._speed_limit - self._behavior.speed_lim_dist])
+            self._local_planner.set_speed(target_speed)
+            control = self._local_planner.run_step(debug=debug)
+
+        # Normal flow: Check if we are braking hard (e.g. car following)
+        hazard_detected = False
+        if control and control.brake > 0.1:
+             hazard_detected = True
+             
+        self._update_stuck_status(hazard_detected)
+
+        return control
 
         # Update latest estimated pose
         self.latest_pose = self._odometry.get_pose(sensor_data, self.prev_sensor_data)
@@ -442,6 +544,19 @@ class BehaviorAgent(BasicAgent):
             self._local_planner.set_speed(target_speed)
             control = self._local_planner.run_step(debug=debug)
 
+        # Update Stuck Status
+        # If we returned early (emergency_stop), hazard_detected is implicit?
+        # No, we need to know if we are stopped due to hazard.
+        # Logic above returns early.
+        # We need to restructure slightly or just check if control is brake.
+        
+        # Better: Check if we are stopped by checking the control returned.
+        hazard_detected = False
+        if control and control.brake > 0.1:
+             hazard_detected = True
+             
+        self._update_stuck_status(hazard_detected)
+
         return control
         
     def is_stuck(self):
@@ -449,12 +564,19 @@ class BehaviorAgent(BasicAgent):
         Checks if the agent is stuck.
         :return: True if stuck, False otherwise
         """
-        return self._stuck_timer > self._stuck_threshold
+        stuck = self._stuck_timer > self._stuck_threshold
+        if stuck:
+             print(f"Agent Stuck! Timer: {self._stuck_timer}")
+        return stuck
 
-    def _update_stuck_status(self):
+    def _update_stuck_status(self, hazard_detected=False):
         """
         Updates the stuck timer based on movement.
         """
+        if hazard_detected:
+            self._stuck_timer = 0
+            return
+
         current_loc = self._vehicle.get_location()
         if self._last_location:
             dist = current_loc.distance(self._last_location)
