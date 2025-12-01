@@ -318,7 +318,7 @@ class BehaviorAgent(BasicAgent):
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
             self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
+            control = self._local_planner.run_step(debug=debug, dt=dt)
 
         # Actual safety distance area, try to follow the speed of the vehicle in front.
         elif 2 * self._behavior.safety_time > ttc >= self._behavior.safety_time:
@@ -327,7 +327,7 @@ class BehaviorAgent(BasicAgent):
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
             self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
+            control = self._local_planner.run_step(debug=debug, dt=dt)
 
         # Normal behavior.
         else:
@@ -335,15 +335,16 @@ class BehaviorAgent(BasicAgent):
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
             self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
+            control = self._local_planner.run_step(debug=debug, dt=dt)
 
         return control
 
-    def run_step(self, debug=False):
+    def run_step(self, debug=False, dt=None):
         """
         Execute one step of navigation.
 
             :param debug: boolean for debugging
+            :param dt: time delta between steps
             :return control: carla.VehicleControl
         """
         # SLAM (Modify as needed)
@@ -434,7 +435,7 @@ class BehaviorAgent(BasicAgent):
                 self._behavior.max_speed,
                 self._speed_limit - 5])
             self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
+            control = self._local_planner.run_step(debug=debug, dt=dt)
 
         # 4: Normal behavior
         else:
@@ -442,7 +443,7 @@ class BehaviorAgent(BasicAgent):
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
             self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
+            control = self._local_planner.run_step(debug=debug, dt=dt)
 
         # Normal flow: Check if we are braking hard (e.g. car following)
         hazard_detected = False
@@ -534,7 +535,7 @@ class BehaviorAgent(BasicAgent):
                 self._behavior.max_speed,
                 self._speed_limit - 5])
             self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
+            control = self._local_planner.run_step(debug=debug, dt=dt)
 
         # 4: Normal behavior
         else:
@@ -542,7 +543,7 @@ class BehaviorAgent(BasicAgent):
                 self._behavior.max_speed,
                 self._speed_limit - self._behavior.speed_lim_dist])
             self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug)
+            control = self._local_planner.run_step(debug=debug, dt=dt)
 
         # Update Stuck Status
         # If we returned early (emergency_stop), hazard_detected is implicit?
