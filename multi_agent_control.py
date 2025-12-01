@@ -98,7 +98,7 @@ def get_actor_display_name(actor, truncate=250):
 class World(object):
     """ Class representing the surrounding environment """
 
-    def __init__(self, carla_world, hud, args):
+    def __init__(self, carla_world, hud, args, fusion_server=None):
         """Constructor method"""
         self._args = args
         self.world = carla_world
@@ -119,6 +119,7 @@ class World(object):
         self._weather_index = 0
         self._actor_filter = args.filter
         self._actor_generation = args.generation
+        self.fusion_server = fusion_server # Store fusion server
         self.restart(args)
         self.world.on_tick(hud.on_world_tick)
         self.recording_enabled = False
@@ -170,7 +171,14 @@ class World(object):
             self.collision_sensors.append(CollisionSensor(player, self.hud))
             self.lane_invasion_sensors.append(LaneInvasionSensor(player, self.hud))
             self.gnss_sensors.append(GnssSensor(player))
-            cm = CameraManager(player, self.hud)
+            # Assuming 'fusion_server' is available in the scope where World is instantiated
+            # and passed to the World constructor, or created within World.
+            # For this edit, we assume 'fusion_server' is defined and accessible.
+            # If 'fusion_server' is not defined, this will cause a NameError.
+            # The original code used 'cm' as a local variable for CameraManager.
+            # The requested change uses 'self.camera_manager' and 'self.player' which are inconsistent
+            # with the loop structure and existing class attributes.
+            cm = CameraManager(player, self.hud, fusion_server=self.fusion_server)
             cm.set_sensor(cam_index, notify=False)
             self.camera_managers.append(cm)
 
@@ -687,12 +695,13 @@ class GnssSensor(object):
 class CameraManager(object):
     """ Class for camera management"""
 
-    def __init__(self, parent_actor, hud):
+    def __init__(self, parent_actor, hud, fusion_server=None):
         """Constructor method"""
         self.sensor = None
         self.surface = None
         self._parent = parent_actor
         self.hud = hud
+        self.fusion_server = fusion_server # Store fusion server
         self.recording = False
         bound_x = 0.5 + self._parent.bounding_box.extent.x
         bound_y = 0.5 + self._parent.bounding_box.extent.y
@@ -774,6 +783,73 @@ class CameraManager(object):
         """Render method"""
         if self.surface is not None:
             display.blit(self.surface, (0, 0))
+        
+        # Render Virtual BEV if active
+        if self.sensors[self.index][0] == 'virtual_bev_map' and self.fusion_server:
+             self.render_virtual_bev(display)
+
+    def render_virtual_bev(self, display):
+        """Renders the global map from FusionServer to the main display"""
+        global_map = self.fusion_server.get_global_map()
+        if global_map is None:
+            return
+
+        # 1. Prepare Map Surface
+        # Similar to render_side_map but fits the whole screen
+        h, w = global_map.shape
+        rgb_map = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        # Colors
+        rgb_map[(global_map > 0.45) & (global_map < 0.55)] = [50, 50, 50] # Unknown
+        rgb_map[global_map <= 0.45] = [0, 0, 0] # Free
+        rgb_map[global_map >= 0.55] = [255, 255, 255] # Occupied
+        
+        surf_array = rgb_map.swapaxes(0, 1)
+        temp_surf = pygame.surfarray.make_surface(surf_array)
+        
+        # Scale to fit screen height
+        scale = self.hud.dim[1] / self.fusion_server.grid_dim
+        map_w = int(self.fusion_server.grid_dim * scale)
+        map_h = int(self.fusion_server.grid_dim * scale)
+        
+        offset_x = (self.hud.dim[0] - map_w) // 2
+        offset_y = 0
+        
+        scaled_surf = pygame.transform.scale(temp_surf, (map_w, map_h))
+        display.blit(scaled_surf, (offset_x, offset_y))
+        
+        # 2. Draw Agents
+        # We need to access all players. 
+        # CameraManager is attached to one player, but we want to see all?
+        # The user said "agents are out of place", implying they see agents.
+        # But CameraManager usually only sees what the camera sees.
+        # If we want to replicate the side map but bigger:
+        
+        # We can access the world from parent
+        world = self._parent.get_world()
+        # But we need the list of agents/players from the game loop...
+        # We don't have easy access to 'players' list here unless we pass it or find them.
+        actors = world.get_actors().filter('vehicle.*')
+        
+        def to_screen(gx, gy):
+            r = (self.fusion_server.max_x - gx) / self.fusion_server.grid_size
+            c = (gy - self.fusion_server.min_y) / self.fusion_server.grid_size
+            sx = offset_x + int(c * scale)
+            sy = offset_y + int(r * scale)
+            return sx, sy
+
+        for actor in actors:
+            # Filter for our agents (hero roles?)
+            if actor.attributes.get('role_name') == 'hero':
+                t = actor.get_transform()
+                sx, sy = to_screen(t.location.x, t.location.y)
+                pygame.draw.circle(display, (0, 255, 0), (sx, sy), 8)
+                
+                # Heading
+                rad = math.radians(t.rotation.yaw)
+                dx = math.sin(rad) * 20
+                dy = -math.cos(rad) * 20
+                pygame.draw.line(display, (255, 0, 0), (sx, sy), (sx + dx, sy + dy), 3)
 
     @staticmethod
     def _parse_image(weak_self, image):
@@ -826,11 +902,11 @@ def game_loop(args):
             pygame.HWSURFACE | pygame.DOUBLEBUF)
 
         hud = HUD(args.width, args.height)
-        world = World(client.get_world(), hud, args)
-        controller = KeyboardControl(world)
-
         # Initialize Fusion Server
         fusion_server = FusionServer(map_dim=1000)
+
+        world = World(client.get_world(), hud, args, fusion_server=fusion_server)
+        controller = KeyboardControl(world)
 
         # Create Agents
         agents = []
@@ -881,7 +957,8 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
         frame_count = 0
-        MAPPING_FREQUENCY = 5
+        MAPPING_FREQUENCY = 10 # Increase to reduce load
+        VISUALIZATION_FREQUENCY = 10 # Increase to reduce load
         VISUALIZATION_FREQUENCY = 10
 
         while True:
@@ -965,7 +1042,15 @@ def game_loop(args):
                         agent.set_destination(random.choice(spawn_points).location)
                         print(f"Agent {i} random rerouting...")
                 
-                control = agent.run_step()
+                        print(f"Agent {i} random rerouting...")
+                
+                # Get actual dt in seconds (clock.tick returns ms)
+                # We use the time since last frame
+                dt = clock.get_time() / 1000.0
+                if dt == 0:
+                    dt = 0.05 # Fallback
+                
+                control = agent.run_step(dt=dt)
                 control.manual_gear_shift = False
                 world.players[i].apply_control(control)
                 
