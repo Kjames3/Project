@@ -73,14 +73,51 @@ class HybridRoutePlanner(object):
         dist = math.sqrt((sx - ex)**2 + (sy - ey)**2)
         steps = int(dist / grid_size) + 1
         
-        for i in range(steps + 1):
-            t = i / float(steps) if steps > 0 else 0
-            r = int(sr + t * (er - sr))
-            c = int(sc + t * (ec - sc))
+        # for i in range(steps + 1):
+        #     t = i / float(steps) if steps > 0 else 0
+        #     r = int(sr + t * (er - sr))
+        #     c = int(sc + t * (ec - sc))
             
-            if 0 <= r < grid_dim and 0 <= c < grid_dim:
-                prob = global_map[r, c]
-                if prob > threshold:
+        #     if 0 <= r < grid_dim and 0 <= c < grid_dim:
+        #         prob = global_map[r, c]
+        #         if prob > threshold:
+        #             return True
+
+        # --- Dynamic obstruction check: other agents from FusionServer ---
+        # If FusionServer is tracking agent trajectories, treat other agents as obstacles
+        # along this segment.
+        if hasattr(self._fusion_server, "trajectories") and self._fusion_server.trajectories:
+            
+            # Helper: distance from a point to the start-end segment in world coords
+            def point_to_segment_dist(px, py):
+                vx = ex - sx
+                vy = ey - sy
+                wx = px - sx
+                wy = py - sy
+                seg_len_sq = vx * vx + vy * vy
+                if seg_len_sq == 0.0:
+                    return math.hypot(px - sx, py - sy)
+                u = max(0.0, min(1.0, (wx * vx + wy * vy) / seg_len_sq))
+                proj_x = sx + u * vx
+                proj_y = sy + u * vy
+                return math.hypot(px - proj_x, py - proj_y)
+
+            # Tune these radii as needed
+            own_ignore_radius = 2.0   # ignore positions extremely close to our start (likely ourselves)
+            agent_radius = 3.0        # treat other agents as discs of this radius
+
+            for agent_id, traj in self._fusion_server.trajectories.items():
+                if not traj:
+                    continue
+
+                ox, oy = traj[-1]  # latest reported position of that agent
+
+                # Ignore positions essentially on top of our current pose (likely our own ID)
+                if math.hypot(ox - sx, oy - sy) < own_ignore_radius:
+                    continue
+
+                # If another agent is close to our planned straight-line segment, treat as blocked
+                if point_to_segment_dist(ox, oy) < agent_radius:
                     return True
 
         return False

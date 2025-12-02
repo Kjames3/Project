@@ -17,7 +17,7 @@ class FusionServer(object):
     FusionServer acts as a central authority for merging local maps from multiple agents.
     """
 
-    def __init__(self, grid_size=0.5, map_dim=500):
+    def __init__(self, grid_size=1, map_dim=1000):
         """
         Constructor method
         :param grid_size: Resolution in meters per pixel
@@ -167,8 +167,8 @@ class FusionServer(object):
         # Add current position
         self.trajectories[agent_id].append((pose[0], pose[1]))
         
-        # Limit history if needed (e.g. 10000 points)
-        if len(self.trajectories[agent_id]) > 10000:
+        # Limit history if needed (e.g. 2000 points)
+        if len(self.trajectories[agent_id]) > 2000:
             self.trajectories[agent_id].pop(0)
 
     def get_global_map(self):

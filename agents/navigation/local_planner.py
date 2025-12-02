@@ -78,7 +78,15 @@ class LocalPlanner(object):
         self._dt = 1.0 / 20.0
         self._target_speed = 20.0  # Km/h
         self._sampling_radius = 2.0
-        self._args_lateral_dict = {'K_P': 1.95, 'K_I': 0.05, 'K_D': 0.2, 'dt': self._dt}
+        self._dt = 1.0 / 20.0
+        self._target_speed = 20.0  # Km/h
+        self._sampling_radius = 2.0
+        # Update this dictionary to use Pure Pursuit defaults
+        self._args_lateral_dict = {
+            'type': 'PurePursuit', # Flag to trigger our change in Controller
+            'L': 2.875,
+            'Kdd': 4.0
+        }
         self._args_longitudinal_dict = {'K_P': 1.0, 'K_I': 0.05, 'K_D': 0, 'dt': self._dt}
         self._max_throt = 0.75
         self._max_brake = 0.3
@@ -277,7 +285,12 @@ class LocalPlanner(object):
             control.manual_gear_shift = False
         else:
             self.target_waypoint, self.target_road_option = self._waypoints_queue[0]
-            control = self._vehicle_controller.run_step(self._target_speed, self.target_waypoint, dt=dt)
+            # CHANGE HERE: Pass 'self._waypoints_queue' instead of 'self.target_waypoint'
+            control = self._vehicle_controller.run_step(
+                self._target_speed, 
+                self._waypoints_queue, # Pass the full list!
+                dt=dt
+            )
 
         if debug:
             draw_waypoints(self._vehicle.get_world(), [self.target_waypoint], 1.0)

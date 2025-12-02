@@ -55,10 +55,9 @@ class BehaviorAgent(BasicAgent):
         # PID Controller Tuning
         if 'lateral_control_dict' not in opt_dict:
             opt_dict['lateral_control_dict'] = {
-                'K_P': 0.6,
-                'K_D': 0.05,
-                'K_I': 0.05,
-                'dt': 0.05
+                'type': 'PurePursuit',
+                'L': 2.875,
+                'Kdd': 4.0
             }
         if 'longitudinal_control_dict' not in opt_dict:
             opt_dict['longitudinal_control_dict'] = {
@@ -122,6 +121,13 @@ class BehaviorAgent(BasicAgent):
         self._stuck_timer = 0
         self._last_location = None
         self._stuck_threshold = 400 # steps (approx 20s)
+
+        # Recovery State
+        self._recovery_state = None # None, 'REVERSE', 'TURN'
+        self._recovery_counter = 0
+        
+        # Frontier History
+        self._visited_frontiers = []
 
     def destroy(self, gt_traj, est_traj):
         ate = AbsoluteTrajectoryError(gt_traj, est_traj)
@@ -347,6 +353,41 @@ class BehaviorAgent(BasicAgent):
             :param dt: time delta between steps
             :return control: carla.VehicleControl
         """
+        # Recovery Logic
+        if self._recovery_state == 'REVERSE':
+            self._recovery_counter -= 1
+            control = carla.VehicleControl()
+            control.throttle = 0.5
+            control.brake = 0.0
+            control.steer = 0.0
+            control.reverse = True
+            if self._recovery_counter <= 0:
+                self._recovery_state = 'TURN'
+                self._recovery_counter = 40 # Turn for ~2 seconds
+            return control
+        
+        elif self._recovery_state == 'TURN':
+            self._recovery_counter -= 1
+            control = carla.VehicleControl()
+            control.throttle = 0.5
+            control.brake = 0.0
+            control.steer = -1.0 if random.random() > 0.5 else 1.0 # Random turn
+            control.reverse = False
+            if self._recovery_counter <= 0:
+                self._recovery_state = None
+                # Now reroute
+                if self.reroute_to_frontier():
+                     print(f"Agent {self._vehicle.id}: Successfully rerouted after recovery.")
+                     self._step_count = 0 # Reset check interval
+                else:
+                     spawn_points = self._map.get_spawn_points()
+                     self.set_destination(random.choice(spawn_points).location)
+            return control
+
+        # Auto-exploration: if current route is almost done, go to a new frontier
+        if len(self._local_planner.get_plan()) < 5:
+             self.reroute_to_frontier()
+
         # SLAM (Modify as needed)
         # self._update_stuck_status() # Moved to end of run_step
         sensor_data = self.get_sensor_data()
@@ -376,10 +417,21 @@ class BehaviorAgent(BasicAgent):
                     target_loc = plan[min(len(plan)-1, 10)][0].transform.location
                     
                     if self._hybrid_planner.is_path_blocked(start_loc, target_loc):
-                        print(f"Agent {self._vehicle.id}: Path blocked! Stopping/Rerouting...")
-                        # Simple behavior: Emergency Stop for now
-                        # In real implementation, we would call set_destination(new_dest)
-                        hazard_detected = True
+                        print(f"Agent {self._vehicle.id}: Path blocked in fused map, trying cooperative reroute...")
+
+                        # Try a cooperative reroute using global frontiers from FusionServer
+                        rerouted = self.reroute_to_frontier()
+
+                        if rerouted:
+                            # We successfully changed destination based on the shared map.
+                            # Reset the interval counter so we don't immediately re-trigger.
+                            self._step_count = 0
+                        else:
+                            # If we can't find a frontier (e.g. everything is mapped),
+                            # just log it and let normal braking / collision logic handle it.
+                            print(f"Agent {self._vehicle.id}: Frontier reroute failed, falling back to local avoidance.")
+                            # (We deliberately do NOT touch hazard_detected here;
+                            #  braking logic below will still update it based on control.brake.)
 
         # Behavior Agent Updates (Do not modify):
         
@@ -479,10 +531,9 @@ class BehaviorAgent(BasicAgent):
                     target_loc = plan[min(len(plan)-1, 10)][0].transform.location
                     
                     if self._hybrid_planner.is_path_blocked(start_loc, target_loc):
-                        print(f"Agent {self._vehicle.id}: Path blocked! Stopping/Rerouting...")
-                        # Simple behavior: Emergency Stop for now
-                        # In real implementation, we would call set_destination(new_dest)
-                        hazard_detected = True
+                        print(f"Agent {self._vehicle.id}: Path blocked! Initiating recovery...")
+                        self._recovery_state = 'REVERSE'
+                        self._recovery_counter = 30 # Reverse for ~1.5 seconds
 
         # Behavior Agent Updates (Do not modify):
         
@@ -602,37 +653,74 @@ class BehaviorAgent(BasicAgent):
 
     def reroute_to_frontier(self):
         """
-        Reroutes the agent to the nearest frontier point.
+        Reroutes the agent to a good frontier point.
+        - Avoids frontiers too close to already visited ones.
+        - Prefers frontiers not too close to other agents.
         :return: True if successful, False otherwise
         """
         if not self._hybrid_planner:
             return False
-            
+
         frontiers = self._hybrid_planner.get_frontiers()
         if not frontiers:
             return False
-            
-        # Find nearest frontier
+
         ego_loc = self._vehicle.get_location()
-        min_dist = float('inf')
+
+        # Get other agents' latest positions from FusionServer
+        other_positions = []
+        fusion = getattr(self._hybrid_planner, "_fusion_server", None)
+        if fusion is not None and hasattr(fusion, "trajectories"):
+            for agent_id, traj in fusion.trajectories.items():
+                if not traj:
+                    continue
+                ox, oy = traj[-1]
+                # Skip our own position (very close)
+                if math.hypot(ox - ego_loc.x, oy - ego_loc.y) < 2.0:
+                    continue
+                other_positions.append((ox, oy))
+
+        def min_dist_to_list(x, y, pts):
+            if not pts:
+                return float('inf')
+            return min(math.hypot(x - px, y - py) for (px, py) in pts)
+
+        # Thresholds
+        min_frontier_dist = 5.0    # ignore frontiers too close to ego
+        min_repeat_dist   = 20.0   # ignore frontiers close to previously visited ones
+        min_sep_other     = 15.0   # prefer frontiers away from other agents
+
+        best_score = float('inf')
         best_frontier = None
-        
+
         for fx, fy in frontiers:
-            dist = math.sqrt((ego_loc.x - fx)**2 + (ego_loc.y - fy)**2)
-            
-            # Filter frontiers too close (prevent loops)
-            if dist < 5.0:
+            d_ego = math.hypot(ego_loc.x - fx, ego_loc.y - fy)
+            if d_ego < min_frontier_dist:
                 continue
-                
-            if dist < min_dist:
-                min_dist = dist
+
+            d_visited = min_dist_to_list(fx, fy, self._visited_frontiers)
+            if d_visited < min_repeat_dist:
+                # We've already explored around here – skip
+                continue
+
+            d_other = min_dist_to_list(fx, fy, other_positions)
+
+            # Simple cost: closer to ego is good, but we add a penalty if too close to others
+            # If d_other is small, cost goes up.
+            cost = d_ego - 0.3 * d_other
+
+            if cost < best_score:
+                best_score = cost
                 best_frontier = (fx, fy)
-                
-        if best_frontier:
-            # Convert to Location
-            # Use ego Z for simplicity, or 0
-            target_loc = carla.Location(x=best_frontier[0], y=best_frontier[1], z=ego_loc.z)
-            
+
+        if best_frontier is not None:
+            # Convert to CARLA Location
+            target_loc = carla.Location(
+                x=best_frontier[0],
+                y=best_frontier[1],
+                z=ego_loc.z
+            )
+
             print(f"Agent {self._vehicle.id}: Rerouting to frontier at ({best_frontier[0]:.1f}, {best_frontier[1]:.1f})")
             
             # Snap to Road Network

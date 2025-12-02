@@ -15,6 +15,7 @@ import collections
 import datetime
 import glob
 import logging
+import time
 import math
 import os
 import numpy.random as random
@@ -139,27 +140,27 @@ class World(object):
             color = random.choice(blueprint.get_attribute('color').recommended_values)
             blueprint.set_attribute('color', color)
 
-        # Spawn the players.
+        # Spawn Agents
         if self.players:
             self.destroy()
             self.players = []
 
         spawn_points = self.map.get_spawn_points()
-        if len(spawn_points) < 2:
-            print('Not enough spawn points!')
+        if len(spawn_points) < self._args.number_of_agents:
+            print(f'Not enough spawn points! Requested {self._args.number_of_agents}, found {len(spawn_points)}')
             sys.exit(1)
 
-        # Spawn Agent A
-        spawn_point_a = spawn_points[0]
-        player_a = self.world.try_spawn_actor(blueprint, spawn_point_a)
-        self.modify_vehicle_physics(player_a)
-        self.players.append(player_a)
+        # Randomize spawn points
+        random.shuffle(spawn_points)
 
-        # Spawn Agent B (far away if possible, or just next index)
-        spawn_point_b = spawn_points[min(10, len(spawn_points)-1)] # Try to pick a distant one
-        player_b = self.world.try_spawn_actor(blueprint, spawn_point_b)
-        self.modify_vehicle_physics(player_b)
-        self.players.append(player_b)
+        for i in range(self._args.number_of_agents):
+            spawn_point = spawn_points[i]
+            player = self.world.try_spawn_actor(blueprint, spawn_point)
+            if player is not None:
+                self.modify_vehicle_physics(player)
+                self.players.append(player)
+            else:
+                print(f"Warning: Could not spawn agent {i} at {spawn_point.location}")
 
         if self._args.sync:
             self.world.tick()
@@ -481,10 +482,11 @@ class HUD(object):
         # 2. Draw Trajectories
         for agent_id, traj in fusion_server.trajectories.items():
             if len(traj) > 1:
-                points = [to_screen(p[0], p[1]) for p in traj]
-                # Filter points? Pygame handles clipping.
-                color = (0, 255, 255) if agent_id == 0 else (255, 0, 255)
-                pygame.draw.lines(map_surface, color, False, points, 2)
+                # OPTIMIZATION: Slice traj[::10] to draw only every 10th point
+                points = [to_screen(p[0], p[1]) for p in traj[::10]]
+                if len(points) > 1:
+                    color = (0, 255, 255) if agent_id == 0 else (255, 0, 255)
+                    pygame.draw.lines(map_surface, color, False, points, 2)
 
         # 3. Draw Agents
         for i, player in enumerate(players):
@@ -722,7 +724,7 @@ class CameraManager(object):
             ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)'],
             ['sensor.camera.semantic_segmentation', cc.CityScapesPalette,
              'Camera Semantic Segmentation (CityScapes Palette)'],
-            ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)'],
+            ['sensor.lidar.ray_cast_semantic', None, 'Lidar (Semantic Ray-Cast)'],
             ['virtual_bev_map', None, 'Occupancy Grid Map']]
         world = self._parent.get_world()
         bp_library = world.get_blueprint_library()
@@ -736,6 +738,11 @@ class CameraManager(object):
                 blp.set_attribute('image_size_y', str(hud.dim[1]))
             elif item[0].startswith('sensor.lidar'):
                 blp.set_attribute('range', '50')
+                blp.set_attribute('rotation_frequency', '20')
+                blp.set_attribute('channels', '32')
+                blp.set_attribute('points_per_second', '100000')
+                blp.set_attribute('upper_fov', '15.0')
+                blp.set_attribute('lower_fov', '-25.0')
             item.append(blp)
         self.index = None
 
@@ -857,6 +864,9 @@ class CameraManager(object):
         if not self:
             return
         if self.sensors[self.index][0].startswith('sensor.lidar'):
+            # Check if image is actually Lidar data (prevent race condition)
+            if not isinstance(image, carla.LidarMeasurement):
+                return
             points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
             points = np.reshape(points, (int(points.shape[0] / 4), 4))
             lidar_data = np.array(points[:, :2])
@@ -869,7 +879,10 @@ class CameraManager(object):
             lidar_img = np.zeros(lidar_img_size)
             lidar_img[tuple(lidar_data.T)] = (255, 255, 255)
             self.surface = pygame.surfarray.make_surface(lidar_img)
-        else:
+        elif self.sensors[self.index][0].startswith('sensor.camera'):
+            # Check if image has convert method (prevent race condition)
+            if not hasattr(image, 'convert'):
+                return
             image.convert(self.sensors[self.index][1])
             array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
             array = np.reshape(array, (image.height, image.width, 4))
@@ -957,7 +970,7 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
         frame_count = 0
-        MAPPING_FREQUENCY = 10 # Increase to reduce load
+        MAPPING_FREQUENCY = 20 # Increase to reduce load
         VISUALIZATION_FREQUENCY = 10 # Increase to reduce load
         VISUALIZATION_FREQUENCY = 10
 
@@ -1026,6 +1039,12 @@ def game_loop(args):
             # Render Side Map (Right Side)
             if frame_count % VISUALIZATION_FREQUENCY == 0:
                 world.hud.render_side_map(display, fusion_server, world.players)
+            
+            # LOGGING FOR REPORT
+            if frame_count % 100 == 0:
+                coverage = fusion_server.calculate_coverage()
+                sim_time = str(datetime.timedelta(seconds=int(world.hud.simulation_time)))
+                print(f"DATA,{len(agents)}_AGENTS,{sim_time},{coverage}")
             
             pygame.display.flip()
 
@@ -1138,6 +1157,12 @@ def main():
         choices=["cautious", "normal", "aggressive"],
         help='Choose one of the possible agent behaviors (default: normal) ',
         default='normal')
+    argparser.add_argument(
+        '--number-of-agents',
+        metavar='N',
+        default=2,
+        type=int,
+        help='Number of agents to spawn (default: 2)')
     argparser.add_argument(
         '--async',
         action='store_false',

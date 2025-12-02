@@ -6,7 +6,7 @@
 # Needede to reduce the max speed of the agents to prevent them from spinning in circles
 class Cautious(object):
     """Class for Cautious agent."""
-    max_speed = 30
+    max_speed = 15
     speed_lim_dist = 6
     speed_decrease = 12
     safety_time = 3
@@ -17,7 +17,7 @@ class Cautious(object):
 
 class Normal(object):
     """Class for Normal agent."""
-    max_speed = 35
+    max_speed = 20
     speed_lim_dist = 3
     speed_decrease = 10
     safety_time = 3
@@ -28,7 +28,7 @@ class Normal(object):
 
 class Aggressive(object):
     """Class for Aggressive agent."""
-    max_speed = 50
+    max_speed = 25
     speed_lim_dist = 1
     speed_decrease = 8
     safety_time = 3

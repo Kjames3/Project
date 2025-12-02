@@ -49,25 +49,48 @@ class VehiclePIDController():
         self._world = self._vehicle.get_world()
         self.past_steering = self._vehicle.get_control().steer
         self._lon_controller = PIDLongitudinalController(self._vehicle, **args_longitudinal)
-        self._lat_controller = PIDLateralController(self._vehicle, offset, **args_lateral)
+        self._lon_controller = PIDLongitudinalController(self._vehicle, **args_longitudinal)
+        
+        # CHECK: If args_lateral contains pure pursuit keys, use it
+        if 'type' in args_lateral and args_lateral['type'] == 'PurePursuit':
+            self._lat_controller = PurePursuitLateralController(
+                self._vehicle,
+                L=args_lateral.get('L', 2.875),
+                Kdd=args_lateral.get('Kdd', 4.0)
+            )
+        else:
+            self._lat_controller = PIDLateralController(self._vehicle, offset, **args_lateral)
 
-    def run_step(self, target_speed, waypoint, dt=None):
+    def run_step(self, target_speed, waypoints, dt=None):
         """
         Execute one step of control invoking both lateral and longitudinal
         PID controllers to reach a target waypoint
         at a given target_speed.
 
             :param target_speed: desired vehicle speed
-            :param waypoint: target location encoded as a waypoint
+            :param waypoints: list of (carla.Waypoint, RoadOption) from the LocalPlanner queue
             :param dt: time differential in seconds
             :return: distance (in meters) to the waypoint
         """
         if dt is not None:
             self._lon_controller._dt = dt
-            self._lat_controller._dt = dt
+            # Only set dt if using PID (Pure Pursuit doesn't use dt directly)
+            if hasattr(self._lat_controller, '_dt'):
+                self._lat_controller._dt = dt
 
         acceleration = self._lon_controller.run_step(target_speed)
-        current_steering = self._lat_controller.run_step(waypoint)
+        
+        # Dispatch based on controller type
+        if isinstance(self._lat_controller, PurePursuitLateralController):
+            current_steering = self._lat_controller.run_step(waypoints)
+        else:
+            # PID controller expects a single waypoint
+            if waypoints:
+                # waypoints is list of (waypoint, RoadOption)
+                target_waypoint = waypoints[0][0]
+                current_steering = self._lat_controller.run_step(target_waypoint)
+            else:
+                current_steering = 0.0
         control = carla.VehicleControl()
         if acceleration >= 0.0:
             control.throttle = min(acceleration, self.max_throt)
@@ -268,3 +291,70 @@ class PIDLateralController():
         self._k_i = K_I
         self._k_d = K_D
         self._dt = dt
+
+class PurePursuitLateralController:
+    """
+    PurePursuitLateralController implements lateral control using the Pure Pursuit algorithm.
+    """
+    def __init__(self, vehicle, L=2.875, Kdd=4.0):
+        self._vehicle = vehicle
+        self.L = L      # Wheelbase length
+        self.Kdd = Kdd  # Lookahead gain
+        self.args_lateral_dict = {}
+
+    def run_step(self, waypoints):
+        """
+        Execute one step of lateral control.
+        :param waypoints: list of (carla.Waypoint, RoadOption) from the LocalPlanner queue
+        """
+        return self._pure_pursuit_control(waypoints)
+
+    def _pure_pursuit_control(self, waypoints):
+        # 1. Get Vehicle State
+        vehicle_transform = self._vehicle.get_transform()
+        vehicle_loc = vehicle_transform.location
+        vehicle_vel = self._vehicle.get_velocity()
+        vf = np.sqrt(vehicle_vel.x**2 + vehicle_vel.y**2)
+
+        # 2. Calculate Lookahead Distance (ld)
+        # ld = Kdd * velocity, clamped to a reasonable range (e.g., 3m to 20m)
+        ld = np.clip(self.Kdd * vf, 3.0, 20.0)
+
+        # 3. Find Target Waypoint
+        # Search the queue for the first waypoint that is at least 'ld' distance away
+        target_wp = None
+        for wp_tuple in waypoints:
+            wp = wp_tuple[0] # Extract carla.Waypoint from tuple
+            dist = vehicle_loc.distance(wp.transform.location)
+            if dist >= ld:
+                target_wp = wp
+                break
+        
+        # Fallback: if no point is far enough, take the last one
+        if target_wp is None:
+            if not waypoints:
+                return 0.0 # No path
+            target_wp = waypoints[-1][0]
+
+        # 4. Calculate Steering Angle (Pure Pursuit Math)
+        target_loc = target_wp.transform.location
+        yaw = np.radians(vehicle_transform.rotation.yaw)
+        
+        # Alpha: Angle between vehicle heading and vector to target
+        alpha = math.atan2(target_loc.y - vehicle_loc.y, target_loc.x - vehicle_loc.x) - yaw
+        
+        # Normalize alpha to range [-pi, pi]
+        alpha = (alpha + np.pi) % (2 * np.pi) - np.pi
+
+        # Steering calculation: delta = atan2(2 * L * sin(alpha), ld)
+        delta = math.atan2(2 * self.L * np.sin(alpha), ld)
+        
+        # Clamp steering to CARLA limits [-1.0, 1.0]
+        delta = np.clip(delta, -1.0, 1.0)
+
+        return delta
+
+    def change_parameters(self, **kwargs):
+        """Update parameters at runtime if needed"""
+        if 'L' in kwargs: self.L = kwargs['L']
+        if 'Kdd' in kwargs: self.Kdd = kwargs['Kdd']
