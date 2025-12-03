@@ -83,7 +83,6 @@ class LocalPlanner(object):
         self._sampling_radius = 2.0
         # Update this dictionary to use Pure Pursuit defaults
         self._args_lateral_dict = {
-            'type': 'PurePursuit', # Flag to trigger our change in Controller
             'L': 2.875,
             'Kdd': 4.0
         }
