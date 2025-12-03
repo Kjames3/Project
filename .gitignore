@@ -12,3 +12,4 @@ venv/
 # Project specific
 _out/
 *.log
+.pstats
