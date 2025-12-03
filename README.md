@@ -3,7 +3,7 @@
 # Project: Multi-Agent Map Fusion & Cooperative Planning
 
 ## Project Goal
-This project implements a multi-agent cooperative system in CARLA. It features two autonomous agents that explore the environment, generating local occupancy grids from LiDAR data. These local maps are fused into a central global map using a log-odds Bayesian update approach. A `FusionServer` manages this global state, which is then shared back to the agents for cooperative path planning. The system includes a `HybridRoutePlanner` that allows agents to detect and avoid obstacles discovered by other agents, and a real-time HUD visualization of the fused global map.
+This project implements a multi-agent cooperative system in CARLA. It features multiple autonomous agents that explore the environment, generating local occupancy grids from LiDAR data. These local maps are fused into a central global map using a log-odds Bayesian update approach. A `FusionServer` manages this global state, which is then shared back to the agents for cooperative path planning. The system includes a `HybridRoutePlanner` that allows agents to detect and avoid obstacles discovered by other agents, and a real-time HUD visualization of the fused global map.
 
 ## How to Run
 
@@ -37,12 +37,15 @@ To run the multi-agent simulation:
 # Activate your conda environment
 conda activate carla_openpcdet
 
-# Run the script
+# Run the script (defaults to 2 agents)
 python3 multi_agent_control.py
+
+# Run with a specific number of agents (e.g., 5)
+python3 multi_agent_control.py --number-of-agents 5
 ```
 
 ## Controls & Usage
-- **TAB**: Switch camera view between Agent A and Agent B.
+- **TAB**: Switch camera view between agents.
 - **ESC** or **Ctrl+Q**: Quit the simulation.
 - **N**: Switch between sensor data types (LiDAR, Semantic LiDAR, Camera).
 
@@ -53,6 +56,7 @@ The HUD displays a real-time overlay of the global map in the bottom-right corne
 - **Gray**: Unknown Space
 - **Blue Dot**: Agent 0
 - **Red Dot**: Agent 1
+- **Other Colors**: Subsequent Agents
 
 ## Key Components
 - **`multi_agent_control.py`**: Main entry point, handles simulation loop and agents.
