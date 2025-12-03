@@ -11,6 +11,44 @@ Local Mapping Module for Occupancy Grid Generation
 
 import numpy as np
 import cv2
+from numba import njit
+
+@njit(fastmath=True)
+def fast_raycast(grid, center_r, center_c, end_r, end_c):
+    """Bresenham's Line Algorithm optimized with Numba"""
+    # Loop through all unique endpoints
+    for i in range(len(end_r)):
+        r0, c0 = center_r, center_c
+        r1, c1 = end_r[i], end_c[i]
+        
+        dx = abs(r1 - r0)
+        dy = abs(c1 - c0)
+        sx = 1 if r0 < r1 else -1
+        sy = 1 if c0 < c1 else -1
+        err = dx - dy
+        
+        while True:
+            # Set pixel to 1 (Free)
+            # Note: The original code used 255 for free in a uint8 mask.
+            # The user's snippet sets grid[r0, c0] = 1.
+            # We should ensure 'grid' is passed as the mask (uint8) or the map itself?
+            # The original code used a separate 'free_mask' (uint8) and drew lines with 255.
+            # Then set self.local_map[free_mask > 0] = 0.0.
+            # If we pass 'free_mask' to this function, we should set it to 1 (or 255).
+            # Let's stick to the user's snippet 'grid[r0, c0] = 1' and assume we pass a zero-initialized grid.
+            # We can then use this grid to update self.local_map.
+            grid[r0, c0] = 1 
+            
+            if r0 == r1 and c0 == c1:
+                break
+                
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                r0 += sx
+            if e2 < dx:
+                err += dx
+                c0 += sy
 
 class LocalMapper(object):
     """
@@ -87,14 +125,15 @@ class LocalMapper(object):
         # This assumes that if the laser hit something, the space in between is empty.
         
         free_mask = np.zeros((self.grid_dim, self.grid_dim), dtype=np.uint8)
-        center_point = (self.center_idx, self.center_idx)
         
         # Unique endpoints to optimize raycasting
-        # We need to keep track of tags? No, for free space, we just need geometry.
-        unique_endpoints = np.unique(np.column_stack((valid_c, valid_r)), axis=0)
+        # Use (row, col) for Numba function
+        unique_endpoints = np.unique(np.column_stack((valid_r, valid_c)), axis=0)
         
-        for uc, ur in unique_endpoints:
-            cv2.line(free_mask, center_point, (uc, ur), 255, 1)
+        if len(unique_endpoints) > 0:
+            end_r = unique_endpoints[:, 0]
+            end_c = unique_endpoints[:, 1]
+            fast_raycast(free_mask, self.center_idx, self.center_idx, end_r, end_c)
             
         # 2. Mark Occupied Cells
         # Filter based on Semantic Tags

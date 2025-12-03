@@ -11,13 +11,83 @@ Fusion Server for Multi-Agent Cooperative Perception
 
 import numpy as np
 import cv2
+from numba import jit
+
+@jit(nopython=True)
+def fast_fusion_update(log_odds_map, local_indices_r, local_indices_c, 
+                      gx, gy, gyaw, grid_size, max_x, min_y, grid_dim, 
+                      local_center, update_val):
+    
+    cos_a = np.cos(gyaw)
+    sin_a = np.sin(gyaw)
+    
+    for i in range(len(local_indices_r)):
+        r = local_indices_r[i]
+        c = local_indices_c[i]
+        
+        # Local -> Vehicle
+        x_veh = (local_center - r) * grid_size
+        y_veh = (c - local_center) * grid_size
+        
+        # Vehicle -> Global
+        X_global = x_veh * cos_a - y_veh * sin_a + gx
+        Y_global = x_veh * sin_a + y_veh * cos_a + gy
+        
+        # Global -> Grid Index
+        global_r = int((max_x - X_global) / grid_size)
+        global_c = int((Y_global - min_y) / grid_size)
+        
+        # Boundary Check
+        if 0 <= global_r < grid_dim and 0 <= global_c < grid_dim:
+            log_odds_map[global_r, global_c] += update_val
+
+@jit(nopython=True)
+def _render_map_jit(log_odds_map, output_image):
+    # output_image is (W, H, 3) for Pygame
+    out_w, out_h, _ = output_image.shape
+    map_h, map_w = log_odds_map.shape # Grid is (Rows, Cols)
+    
+    scale_x = map_w / out_w
+    scale_y = map_h / out_h
+    
+    for x in range(out_w):
+        for y in range(out_h):
+            # Map x (col) -> mc
+            # Map y (row) -> mr
+            mc = int(x * scale_x)
+            mr = int(y * scale_y)
+            
+            if mr >= 0 and mr < map_h and mc >= 0 and mc < map_w:
+                l_val = log_odds_map[mr, mc]
+                
+                # Sigmoid: p = 1 / (1 + exp(-l))
+                # Optimization: check sign of l_val first to avoid exp?
+                # Or just do it.
+                prob = 1.0 / (1.0 + np.exp(-l_val))
+                
+                # Color
+                if prob < 0.45:
+                    # Free -> Black
+                    output_image[x, y, 0] = 0
+                    output_image[x, y, 1] = 0
+                    output_image[x, y, 2] = 0
+                elif prob > 0.55:
+                    # Occupied -> White
+                    output_image[x, y, 0] = 255
+                    output_image[x, y, 1] = 255
+                    output_image[x, y, 2] = 255
+                else:
+                    # Unknown -> Gray
+                    output_image[x, y, 0] = 50
+                    output_image[x, y, 1] = 50
+                    output_image[x, y, 2] = 50
 
 class FusionServer(object):
     """
     FusionServer acts as a central authority for merging local maps from multiple agents.
     """
 
-    def __init__(self, grid_size=1, map_dim=1000):
+    def __init__(self, grid_size=1, map_dim=600):
         """
         Constructor method
         :param grid_size: Resolution in meters per pixel
@@ -26,18 +96,6 @@ class FusionServer(object):
         self.grid_size = grid_size
         self.map_dim = map_dim
         self.grid_dim = int(self.map_dim / self.grid_size)
-        
-        # Global Map Origin (World Coordinates)
-        # Centered at (0,0) -> Top-Left of Grid is (-map_dim/2, -map_dim/2) ??
-        # No, usually (0,0) is center.
-        # Let's define Top-Left World Coordinate:
-        # X_min = -map_dim / 2
-        # Y_min = -map_dim / 2
-        # But CARLA Y is inverted relative to standard image?
-        # Let's stick to:
-        # Grid Row 0 = Max X (Forward)
-        # Grid Col 0 = Min Y (Left)
-        # This aligns with standard "North Up" map if X is North.
         
         self.min_x = -self.map_dim / 2.0
         self.max_x = self.map_dim / 2.0
@@ -56,104 +114,42 @@ class FusionServer(object):
         
         # Trajectories: agent_id -> list of (x, y)
         self.trajectories = {}
+        
+        # Local Maps: agent_id -> local_occupancy_grid
+        self.maps = {}
 
     def update_map(self, agent_id, local_occupancy_grid, pose):
         """
         Updates the global map with a local occupancy grid from an agent.
-
-        :param agent_id: ID of the agent sending the update
-        :param local_occupancy_grid: 2D numpy array (0.0=Free, 1.0=Occ, 0.5=Unknown)
-        :param pose: Tuple (x, y, yaw) representing the agent's global pose (yaw in degrees)
         """
         if local_occupancy_grid is None:
             return
 
-        # 1. Get Local Grid Indices (Occupied and Free)
-        # Local Grid is (N, N). Center is vehicle.
-        # We need to iterate over all cells? Or just non-unknown ones.
-        # Vectorized approach is better.
-        
-        local_dim = local_occupancy_grid.shape[0]
-        local_center = local_dim // 2
-        
-        # Find indices of Free and Occupied cells
-        # Free: < 0.4 (approx 0.0)
-        # Occupied: > 0.6 (approx 1.0)
-        # Unknown: ~0.5
-        
-        free_indices = np.where(local_occupancy_grid < 0.4)
-        occ_indices = np.where(local_occupancy_grid > 0.6)
-        
-        # Combine to process
-        # We need to transform these indices to Global Frame
-        
-        # Local Indices (r, c) -> Vehicle Frame (x, y)
-        # In mapping.py:
-        # px_r = center - x/res => x = (center - px_r) * res
-        # px_c = center + y/res => y = (px_c - center) * res
-        
-        def transform_indices(indices, is_occupied):
-            r, c = indices
-            
-            # 1. Local Grid -> Vehicle Frame
-            x_veh = (local_center - r) * self.grid_size
-            y_veh = (c - local_center) * self.grid_size
-            
-            # 2. Vehicle Frame -> Global Frame
-            # Pose: (x, y, yaw_deg)
-            gx, gy, gyaw_deg = pose
-            gyaw = np.radians(gyaw_deg)
-            
-            cos_a = np.cos(gyaw)
-            sin_a = np.sin(gyaw)
-            
-            # Rotation + Translation
-            # X_global = x_veh * cos - y_veh * sin + gx
-            # Y_global = x_veh * sin + y_veh * cos + gy
-            
-            X_global = x_veh * cos_a - y_veh * sin_a + gx
-            Y_global = x_veh * sin_a + y_veh * cos_a + gy
-            
-            # DEBUG: Check ranges
-            # if len(X_global) > 0:
-            #      print(f"Global Range X: [{np.min(X_global):.2f}, {np.max(X_global):.2f}], Y: [{np.min(Y_global):.2f}, {np.max(Y_global):.2f}]")
-            #      print(f"Map Bounds X: [{self.min_x}, {self.max_x}], Y: [{self.min_y}, {self.max_y}]")
-            #      print(f"Agent Pose: {pose}")
-            
-            # 3. Global Frame -> Global Grid Indices
-            # Row = (Max_X - X_global) / res
-            # Col = (Y_global - Min_Y) / res
-            
-            global_r = ((self.max_x - X_global) / self.grid_size).astype(np.int32)
-            global_c = ((Y_global - self.min_y) / self.grid_size).astype(np.int32)
-            
-            # Filter valid indices
-            valid_mask = (global_r >= 0) & (global_r < self.grid_dim) & \
-                         (global_c >= 0) & (global_c < self.grid_dim)
-            
-            valid_r = global_r[valid_mask]
-            valid_c = global_c[valid_mask]
-            
-            # Update Log-Odds
-            update_val = self.l_occ if is_occupied else self.l_free
-            
-            # We use 'at' for unbuffered add if there are duplicates?
-            # Or just simple add.
-            # np.add.at allows handling duplicate indices correctly if multiple local cells map to same global cell
-            np.add.at(self.log_odds_map, (valid_r, valid_c), update_val)
-            
-            # DEBUG
-            if len(valid_r) > 0:
-                print(f"Agent {agent_id}: Updated {len(valid_r)} cells. Val: {update_val}")
+        # Store local map
+        self.maps[agent_id] = local_occupancy_grid
 
+        rows, cols = local_occupancy_grid.shape
+        local_center = rows // 2
+        
+        # Find indices
+        # Free: < 0.45
+        free_indices = np.where(local_occupancy_grid < 0.45)
+        # Occupied: > 0.55
+        occ_indices = np.where(local_occupancy_grid > 0.55)
+        
         # Process Free
-        transform_indices(free_indices, is_occupied=False)
-        
+        if len(free_indices[0]) > 0:
+            fast_fusion_update(self.log_odds_map, free_indices[0], free_indices[1], 
+                               pose[0], pose[1], np.radians(pose[2]), self.grid_size, 
+                               self.max_x, self.min_y, self.grid_dim, 
+                               local_center, self.l_free)
+                           
         # Process Occupied
-        transform_indices(occ_indices, is_occupied=True)
-        
-        # Clamp
-        np.clip(self.log_odds_map, self.l_min, self.l_max, out=self.log_odds_map)
+        if len(occ_indices[0]) > 0:
+            fast_fusion_update(self.log_odds_map, occ_indices[0], occ_indices[1], 
+                               pose[0], pose[1], np.radians(pose[2]), self.grid_size, 
+                               self.max_x, self.min_y, self.grid_dim, 
+                               local_center, self.l_occ)
 
     def update_trajectory(self, agent_id, pose):
         """
@@ -164,6 +160,13 @@ class FusionServer(object):
         if agent_id not in self.trajectories:
             self.trajectories[agent_id] = []
         
+        # Only add point if it's far enough from the last one (e.g., 1 meter)
+        if self.trajectories[agent_id]:
+            last_pose = self.trajectories[agent_id][-1]
+            dist = np.sqrt((pose[0]-last_pose[0])**2 + (pose[1]-last_pose[1])**2)
+            if dist < 1.0:
+                return
+
         # Add current position
         self.trajectories[agent_id].append((pose[0], pose[1]))
         
@@ -174,12 +177,18 @@ class FusionServer(object):
     def get_global_map(self):
         """
         Returns the current fused global map as probabilities.
-
         :return: 2D numpy array representing the global occupancy grid (0.0-1.0)
         """
-        # Sigmoid: p = 1 / (1 + exp(-l))
-        # Sigmoid: p = 1 / (1 + exp(-l))
         return 1.0 / (1.0 + np.exp(-self.log_odds_map))
+        
+    def get_map_image(self, width, height):
+        """
+        Returns a rendered RGB image of the map, scaled to width x height.
+        :return: Numpy array (width, height, 3) ready for pygame.surfarray.make_surface
+        """
+        output_image = np.zeros((width, height, 3), dtype=np.uint8)
+        _render_map_jit(self.log_odds_map, output_image)
+        return output_image
 
     def calculate_coverage(self):
         """Calculates mapped area in square meters"""
@@ -197,16 +206,9 @@ class FusionServer(object):
         probs = self.get_global_map()
         
         # Convert to 0-255 image
-        # Free (Low Prob) -> 255 (White)
-        # Occupied (High Prob) -> 0 (Black)
-        # Unknown -> 127 (Gray)
-        
         image = np.full(probs.shape, 127, dtype=np.uint8)
         image[probs < 0.45] = 255 # Free is White
         image[probs > 0.55] = 0   # Occupied is Black
-        
-        # Flip to match visualization if needed
-        # image = cv2.flip(image, 0)
         
         cv2.imwrite(filename, image)
         print(f"Map saved to {filename}")
