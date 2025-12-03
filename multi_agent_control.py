@@ -1024,11 +1024,16 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
         frame_count = 0
-        MAPPING_FREQUENCY = 20 # Increase to reduce load
+        MAPPING_FREQUENCY = 10 # Increase to reduce load
         VISUALIZATION_FREQUENCY = 20 # Update side view every 20 frames
         WARMUP_FRAMES = 40
 
         while True:
+            if args.sync:
+                world.world.tick()
+            else:
+                world.world.wait_for_tick()
+
             clock.tick_busy_loop(60)
             if controller.parse_events(world):
                 return
