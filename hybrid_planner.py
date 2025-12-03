@@ -12,6 +12,34 @@ Combines global static route planning with dynamic occupancy grid from FusionSer
 
 import numpy as np
 import math
+from numba import njit
+
+@njit(fastmath=True)
+def _check_line_numba(global_map, sr, sc, er, ec, grid_dim, threshold):
+    """
+    Optimized Bresenham-like line check. 
+    Returns True if ANY cell on the line is occupied (> threshold).
+    """
+    # Calculate distance in grid cells
+    dx = er - sr
+    dy = ec - sc
+    distance = math.sqrt(dx*dx + dy*dy)
+    steps = int(distance) + 1
+    
+    for i in range(steps + 1):
+        t = i / float(steps) if steps > 0 else 0.0
+        
+        # Interpolate indices
+        r = int(sr + t * dx)
+        c = int(sc + t * dy)
+        
+        # Boundary check
+        if 0 <= r < grid_dim and 0 <= c < grid_dim:
+            # Check occupancy
+            if global_map[r, c] > threshold:
+                return True
+                
+    return False
 
 class HybridRoutePlanner(object):
     """
@@ -68,20 +96,9 @@ class HybridRoutePlanner(object):
         er = int((max_x - ex) / grid_size)
         ec = int((ey - min_y) / grid_size)
 
-        # Bresenham's Line Algorithm (or simple sampling)
-        # We can just sample points along the line
-        dist = math.sqrt((sx - ex)**2 + (sy - ey)**2)
-        steps = int(dist / grid_size) + 1
-        
-        # for i in range(steps + 1):
-        #     t = i / float(steps) if steps > 0 else 0
-        #     r = int(sr + t * (er - sr))
-        #     c = int(sc + t * (ec - sc))
-            
-        #     if 0 <= r < grid_dim and 0 <= c < grid_dim:
-        #         prob = global_map[r, c]
-        #         if prob > threshold:
-        #             return True
+        # Bresenham's Line Algorithm (Optimized with Numba)
+        if _check_line_numba(global_map, sr, sc, er, ec, grid_dim, threshold):
+            return True
 
         # --- Dynamic obstruction check: other agents from FusionServer ---
         # If FusionServer is tracking agent trajectories, treat other agents as obstacles

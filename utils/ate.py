@@ -5,6 +5,54 @@ EE260: Introduction to Self-Driving Stack
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation
+from numba import njit
+
+@njit
+def fast_compute_errors(traj_est, traj_gt):
+    n = len(traj_est)
+    # Pre-allocate output arrays for speed
+    pos_errors = np.zeros(n, dtype=np.float64)
+    rot_errors = np.zeros(n, dtype=np.float64)
+
+    for i in range(n):
+        est = traj_est[i]
+        gt = traj_gt[i]
+
+        # Position Error (Euclidean)
+        dx = est[0] - gt[0]
+        dy = est[1] - gt[1]
+        dz = est[2] - gt[2]
+        pos_errors[i] = np.sqrt(dx*dx + dy*dy + dz*dz)
+
+        # Rotation Error (Quaternion Dot Product)
+        # Assuming [w, x, y, z] layout. 
+        # Note: The original code used est[3:] which is 4 elements.
+        # We need to be careful about layout. CARLA usually provides (x, y, z, roll, pitch, yaw) or similar.
+        # But ATE class reshapes to (N, 7). 
+        # Let's assume 3:7 are quaternion (qx, qy, qz, qw) or similar.
+        # The original code did: q_est = est[3:]
+        
+        q_est = est[3:]
+        q_gt = gt[3:]
+        
+        # Manual normalization to avoid numpy overhead inside loop
+        norm_est = np.sqrt(np.sum(q_est**2))
+        norm_gt = np.sqrt(np.sum(q_gt**2))
+        
+        if norm_est > 1e-6 and norm_gt > 1e-6:
+            # Dot product
+            dot = 0.0
+            for j in range(4):
+                dot += (q_est[j]/norm_est) * (q_gt[j]/norm_gt)
+            
+            dot = np.abs(dot)
+            if dot > 1.0: dot = 1.0
+            
+            rot_errors[i] = 2.0 * np.arccos(dot)
+        else:
+            rot_errors[i] = 0.0
+            
+    return pos_errors, rot_errors
 
 class AbsoluteTrajectoryError:
     def __init__(self, traj_gt, traj_est):
@@ -63,35 +111,18 @@ class AbsoluteTrajectoryError:
 
     def compute_trajectory_error(self):
         """Compute ATE between aligned trajectories"""
-        errors = []
-        n = min(len(self.traj_est), len(self.traj_gt))
+        # Ensure arrays are float64 for Numba
+        est = self.traj_est.astype(np.float64)
+        gt = self.traj_gt.astype(np.float64)
         
-        for i in range(n):
-            est = self.traj_est[i]
-            gt = self.traj_gt[i]
-
-            # Position Error
-            pos_error = np.linalg.norm(est[:3] - gt[:3])
-            
-            # Rotation Error
-            q_est = est[3:]
-            q_gt = gt[3:]
-            
-            norm_est = np.linalg.norm(q_est)
-            norm_gt = np.linalg.norm(q_gt)
-            
-            if norm_est > 1e-6 and norm_gt > 1e-6:
-                q_est /= norm_est
-                q_gt /= norm_gt
-                dot = np.clip(np.abs(np.dot(q_est, q_gt)), -1.0, 1.0)
-                rot_error = 2 * np.arccos(dot)
-            else:
-                rot_error = 0.0
-            
-            errors.append({'position_error': pos_error, 'rotation_error': rot_error})
+        p_errs, r_errs = fast_compute_errors(est, gt)
         
-        self.traj_err = errors 
-        return errors
+        # Convert back to dictionary format if needed, or just store arrays
+        self.traj_err = []
+        for i in range(len(p_errs)):
+            self.traj_err.append({'position_error': p_errs[i], 'rotation_error': r_errs[i]})
+        
+        return self.traj_err
     
     def get_statistics(self):
         """Return RMSE and other stats"""
