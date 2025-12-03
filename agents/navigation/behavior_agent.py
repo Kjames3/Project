@@ -57,7 +57,7 @@ class BehaviorAgent(BasicAgent):
             opt_dict['lateral_control_dict'] = {
                 'type': 'PurePursuit',
                 'L': 2.875,
-                'Kdd': 4.0
+                'Kdd': 1.5
             }
         if 'longitudinal_control_dict' not in opt_dict:
             opt_dict['longitudinal_control_dict'] = {
@@ -125,6 +125,11 @@ class BehaviorAgent(BasicAgent):
         # Recovery State
         self._recovery_state = None # None, 'REVERSE', 'TURN'
         self._recovery_counter = 0
+        self._in_recovery = False
+
+        # Recovery Steps
+        self._recovery_steps = 0
+        self._max_recovery_steps = 80
         
         # Frontier History
         self._visited_frontiers = []
@@ -156,11 +161,11 @@ class BehaviorAgent(BasicAgent):
             'x': 0.7, 'y': 0.0, 'z': 1.60, 
             'yaw': 0.0, 'pitch': 0.0, 'roll': 0.0,
             'range': 50, 
-            'rotation_frequency': 20, 
-            'channels': 32, 
-            'upper_fov': 10, 
-            'lower_fov': -30, 
-            'points_per_second': 56000,
+            'rotation_frequency': 10, 
+            'channels': 24, 
+            'upper_fov': 5, 
+            'lower_fov': -25, 
+            'points_per_second': 32000,
             'id': 'LIDAR'
         })
 
@@ -349,11 +354,20 @@ class BehaviorAgent(BasicAgent):
         """
         Execute one step of navigation.
 
-            :param debug: boolean for debugging
-            :param dt: time delta between steps
-            :return control: carla.VehicleControl
+        :param debug: boolean for debugging
+        :param dt: time delta between steps
+        :return control: carla.VehicleControl
         """
-        # Recovery Logic
+
+        # ------------------------------------------------------------------
+        # 0. If no planner, just stop
+        # ------------------------------------------------------------------
+        if self._local_planner is None:
+            return carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
+
+        # ------------------------------------------------------------------
+        # 1. Recovery state machine (REVERSE -> TURN -> reroute)
+        # ------------------------------------------------------------------
         if self._recovery_state == 'REVERSE':
             self._recovery_counter -= 1
             control = carla.VehicleControl()
@@ -361,252 +375,174 @@ class BehaviorAgent(BasicAgent):
             control.brake = 0.0
             control.steer = 0.0
             control.reverse = True
+
             if self._recovery_counter <= 0:
+                # Switch to TURN phase
                 self._recovery_state = 'TURN'
-                self._recovery_counter = 40 # Turn for ~2 seconds
+                self._recovery_counter = 40  # ~2 seconds of turning
+
+            # In recovery we bypass normal logic
             return control
-        
+
         elif self._recovery_state == 'TURN':
             self._recovery_counter -= 1
             control = carla.VehicleControl()
             control.throttle = 0.5
             control.brake = 0.0
-            control.steer = -1.0 if random.random() > 0.5 else 1.0 # Random turn
+            control.steer = -1.0 if random.random() > 0.5 else 1.0  # random hard turn
             control.reverse = False
+
             if self._recovery_counter <= 0:
+                # Finish recovery, try cooperative reroute
                 self._recovery_state = None
-                # Now reroute
-                if self.reroute_to_frontier():
-                     print(f"Agent {self._vehicle.id}: Successfully rerouted after recovery.")
-                     self._step_count = 0 # Reset check interval
-                else:
-                     spawn_points = self._map.get_spawn_points()
-                     self.set_destination(random.choice(spawn_points).location)
+                self._in_recovery = False
+                try:
+                    if self.reroute_to_frontier():
+                        print(f"Agent {self._vehicle.id}: Successfully rerouted after recovery.")
+                        self._step_count = 0  # Reset coop-planner interval
+                    else:
+                        # Fallback: random spawn point as new destination
+                        spawn_points = self._map.get_spawn_points()
+                        if spawn_points:
+                            self.set_destination(random.choice(spawn_points).location)
+                except Exception as e:
+                    print(f"Agent {self._vehicle.id}: error during post-recovery reroute: {e}")
+
             return control
 
-        # Auto-exploration: if current route is almost done, go to a new frontier
-        if len(self._local_planner.get_plan()) < 5:
-             self.reroute_to_frontier()
+        # ------------------------------------------------------------------
+        # 2. Auto-exploration: if current route almost done, go to a new frontier
+        # ------------------------------------------------------------------
+        if self._hybrid_planner:
+            current_plan = self._local_planner.get_plan()
+            if not current_plan or len(current_plan) < 5:
+                # 1. Try to find a Frontier first (Exploration)
+                if self.reroute_to_frontier():
+                    print(f"Agent {self._vehicle.id}: Exploring new frontier.")
+                else:
+                    # 2. If no frontiers are reachable/found, pick random point (Fallback)
+                    spawn_points = self._map.get_spawn_points()
+                    if spawn_points:
+                        self.set_destination(random.choice(spawn_points).location)
+                        print(f"Agent {self._vehicle.id}: No frontier found, wandering.")
 
-        # SLAM (Modify as needed)
-        # self._update_stuck_status() # Moved to end of run_step
+        # ------------------------------------------------------------------
+        # 3. SLAM / Mapping: odometry + LiDAR → local map
+        # ------------------------------------------------------------------
         sensor_data = self.get_sensor_data()
 
-        # Update latest estimated pose
+        # Update latest estimated pose from odometry
         self.latest_pose = self._odometry.get_pose(sensor_data, self.prev_sensor_data)
-
-        # Update prev sensor data
         self.prev_sensor_data = sensor_data
 
-        # Mapping Update
+        # Local occupancy mapping from LiDAR
         if 'LIDAR' in sensor_data:
-            lidar_data = sensor_data['LIDAR'][1] # [timestamp, data]
+            lidar_data = sensor_data['LIDAR'][1]  # [timestamp, measurement]
             self._local_mapper.process_lidar(lidar_data, self._vehicle.get_transform())
 
-        # Cooperative Replanning Check
+        # ------------------------------------------------------------------
+        # 4. Cooperative replanning using fused map (HybridRoutePlanner)
+        # ------------------------------------------------------------------
         if self._hybrid_planner:
             self._step_count += 1
             if self._step_count % self._check_interval == 0:
-                # Check path ahead
-                # Get next few waypoints
                 plan = self._local_planner.get_plan()
                 if plan:
-                    # Check up to 20 meters ahead
                     start_loc = self._vehicle.get_location()
-                    # Find a waypoint ~20m ahead or last one
-                    target_loc = plan[min(len(plan)-1, 10)][0].transform.location
-                    
+                    target_loc = plan[min(len(plan) - 1, 10)][0].transform.location
+
                     if self._hybrid_planner.is_path_blocked(start_loc, target_loc):
                         print(f"Agent {self._vehicle.id}: Path blocked in fused map, trying cooperative reroute...")
 
-                        # Try a cooperative reroute using global frontiers from FusionServer
-                        rerouted = self.reroute_to_frontier()
+                        rerouted = False
+                        try:
+                            rerouted = self.reroute_to_frontier()
+                        except Exception as e:
+                            print(f"Agent {self._vehicle.id}: error in reroute_to_frontier: {e}")
 
                         if rerouted:
-                            # We successfully changed destination based on the shared map.
-                            # Reset the interval counter so we don't immediately re-trigger.
+                            # Successfully changed destination based on shared map
                             self._step_count = 0
                         else:
-                            # If we can't find a frontier (e.g. everything is mapped),
-                            # just log it and let normal braking / collision logic handle it.
-                            print(f"Agent {self._vehicle.id}: Frontier reroute failed, falling back to local avoidance.")
-                            # (We deliberately do NOT touch hazard_detected here;
-                            #  braking logic below will still update it based on control.brake.)
+                            # Could not reroute now → engage recovery next step
+                            print(f"Agent {self._vehicle.id}: Frontier reroute failed, initiating recovery...")
+                            self._start_recovery()
 
-        # Behavior Agent Updates (Do not modify):
-        
+        # ------------------------------------------------------------------
+        # 5. Standard BehaviorAgent logic (traffic, pedestrians, vehicles, etc.)
+        # ------------------------------------------------------------------
         self._update_information()
 
         control = None
+
         if self._behavior.tailgate_counter > 0:
             self._behavior.tailgate_counter -= 1
 
         ego_vehicle_loc = self._vehicle.get_location()
         ego_vehicle_wp = self._map.get_waypoint(ego_vehicle_loc)
 
-        # 1: Red lights and stops behavior
-        if self.traffic_light_manager():
-            self._update_stuck_status(True)
-            return self.emergency_stop()
+        # 5.1: Red lights and stops behavior
+        # 5.1: Red lights and stops behavior
+        # if self.traffic_light_manager():
+        #     self._update_stuck_status(True)
+        #     return self.emergency_stop()
 
-        # 2.1: Pedestrian avoidance behaviors
+        # 5.2: Pedestrian avoidance behaviors
         walker_state, walker, w_distance = self.pedestrian_avoid_manager(ego_vehicle_wp)
 
         if walker_state:
-            # Distance is computed from the center of the two cars,
-            # we use bounding boxes to calculate the actual distance
             distance = w_distance - max(
                 walker.bounding_box.extent.y, walker.bounding_box.extent.x) - max(
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
-            # Emergency brake if the car is very close.
             if distance < self._behavior.braking_distance:
                 self._update_stuck_status(True)
                 return self.emergency_stop()
 
-        # 2.2: Car following behaviors
+        # 5.3: Car following / collision avoidance
         vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
 
         if vehicle_state:
-            # Distance is computed from the center of the two cars,
-            # we use bounding boxes to calculate the actual distance
             distance = distance - max(
                 vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
-            # Emergency brake if the car is very close.
             if distance < self._behavior.braking_distance:
                 self._update_stuck_status(True)
                 return self.emergency_stop()
             else:
                 control = self.car_following_manager(vehicle, distance)
 
-        # 3: Intersection behavior
-        elif self._incoming_waypoint.is_junction and (self._incoming_direction in [RoadOption.LEFT, RoadOption.RIGHT]):
+        # 5.4: Intersection behavior
+        elif self._incoming_waypoint.is_junction and \
+                (self._incoming_direction in [RoadOption.LEFT, RoadOption.RIGHT]):
+
             target_speed = min([
                 self._behavior.max_speed,
-                self._speed_limit - 5])
+                self._speed_limit - 5
+            ])
             self._local_planner.set_speed(target_speed)
             control = self._local_planner.run_step(debug=debug, dt=dt)
 
-        # 4: Normal behavior
+        # 5.5: Normal road-following behavior
         else:
             target_speed = min([
                 self._behavior.max_speed,
-                self._speed_limit - self._behavior.speed_lim_dist])
+                self._speed_limit - self._behavior.speed_lim_dist
+            ])
             self._local_planner.set_speed(target_speed)
             control = self._local_planner.run_step(debug=debug, dt=dt)
 
-        # Normal flow: Check if we are braking hard (e.g. car following)
+        # ------------------------------------------------------------------
+        # 6. Stuck / crash detection → feed into recovery logic
+        # ------------------------------------------------------------------
         hazard_detected = False
         if control and control.brake > 0.1:
-             hazard_detected = True
-             
-        self._update_stuck_status(hazard_detected)
+            hazard_detected = True
 
-        return control
-
-        # Update latest estimated pose
-        self.latest_pose = self._odometry.get_pose(sensor_data, self.prev_sensor_data)
-
-        # Update prev sensor data
-        self.prev_sensor_data = sensor_data
-
-        # Mapping Update
-        if 'LIDAR' in sensor_data:
-            lidar_data = sensor_data['LIDAR'][1] # [timestamp, data]
-            self._local_mapper.process_lidar(lidar_data, self._vehicle.get_transform())
-
-        # Cooperative Replanning Check
-        if self._hybrid_planner:
-            self._step_count += 1
-            if self._step_count % self._check_interval == 0:
-                # Check path ahead
-                # Get next few waypoints
-                plan = self._local_planner.get_plan()
-                if plan:
-                    # Check up to 20 meters ahead
-                    start_loc = self._vehicle.get_location()
-                    # Find a waypoint ~20m ahead or last one
-                    target_loc = plan[min(len(plan)-1, 10)][0].transform.location
-                    
-                    if self._hybrid_planner.is_path_blocked(start_loc, target_loc):
-                        print(f"Agent {self._vehicle.id}: Path blocked! Initiating recovery...")
-                        self._recovery_state = 'REVERSE'
-                        self._recovery_counter = 30 # Reverse for ~1.5 seconds
-
-        # Behavior Agent Updates (Do not modify):
-        
-        self._update_information()
-
-        control = None
-        if self._behavior.tailgate_counter > 0:
-            self._behavior.tailgate_counter -= 1
-
-        ego_vehicle_loc = self._vehicle.get_location()
-        ego_vehicle_wp = self._map.get_waypoint(ego_vehicle_loc)
-
-        # 1: Red lights and stops behavior
-        if self.traffic_light_manager():
-            return self.emergency_stop()
-
-        # 2.1: Pedestrian avoidance behaviors
-        walker_state, walker, w_distance = self.pedestrian_avoid_manager(ego_vehicle_wp)
-
-        if walker_state:
-            # Distance is computed from the center of the two cars,
-            # we use bounding boxes to calculate the actual distance
-            distance = w_distance - max(
-                walker.bounding_box.extent.y, walker.bounding_box.extent.x) - max(
-                    self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
-
-            # Emergency brake if the car is very close.
-            if distance < self._behavior.braking_distance:
-                return self.emergency_stop()
-
-        # 2.2: Car following behaviors
-        vehicle_state, vehicle, distance = self.collision_and_car_avoid_manager(ego_vehicle_wp)
-
-        if vehicle_state:
-            # Distance is computed from the center of the two cars,
-            # we use bounding boxes to calculate the actual distance
-            distance = distance - max(
-                vehicle.bounding_box.extent.y, vehicle.bounding_box.extent.x) - max(
-                    self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
-
-            # Emergency brake if the car is very close.
-            if distance < self._behavior.braking_distance:
-                return self.emergency_stop()
-            else:
-                control = self.car_following_manager(vehicle, distance)
-
-        # 3: Intersection behavior
-        elif self._incoming_waypoint.is_junction and (self._incoming_direction in [RoadOption.LEFT, RoadOption.RIGHT]):
-            target_speed = min([
-                self._behavior.max_speed,
-                self._speed_limit - 5])
-            self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug, dt=dt)
-
-        # 4: Normal behavior
-        else:
-            target_speed = min([
-                self._behavior.max_speed,
-                self._speed_limit - self._behavior.speed_lim_dist])
-            self._local_planner.set_speed(target_speed)
-            control = self._local_planner.run_step(debug=debug, dt=dt)
-
-        # Update Stuck Status
-        # If we returned early (emergency_stop), hazard_detected is implicit?
-        # No, we need to know if we are stopped due to hazard.
-        # Logic above returns early.
-        # We need to restructure slightly or just check if control is brake.
-        
-        # Better: Check if we are stopped by checking the control returned.
-        hazard_detected = False
-        if control and control.brake > 0.1:
-             hazard_detected = True
-             
+        # This increments an internal timer while braking & not moving;
+        # once threshold is exceeded, _update_stuck_status should set
+        # self._recovery_state = 'REVERSE' and self._recovery_counter.
         self._update_stuck_status(hazard_detected)
 
         return control
@@ -621,22 +557,47 @@ class BehaviorAgent(BasicAgent):
              print(f"Agent Stuck! Timer: {self._stuck_timer}")
         return stuck
 
-    def _update_stuck_status(self, hazard_detected=False):
+    def _update_stuck_status(self, hazard_detected: bool):
         """
-        Updates the stuck timer based on movement.
+        Update stuck status and trigger recovery if needed.
+        Called once per run_step.
         """
-        if hazard_detected:
-            self._stuck_timer = 0
+        loc = self._vehicle.get_location()
+
+        # Initialize last_location on first call
+        if self._last_location is None:
+            self._last_location = loc
             return
 
-        current_loc = self._vehicle.get_location()
-        if self._last_location:
-            dist = current_loc.distance(self._last_location)
-            if dist < 0.1: # Not moving much
-                self._stuck_timer += 1
-            else:
-                self._stuck_timer = 0
-        self._last_location = current_loc
+        # Distance moved since last check
+        dx = loc.x - self._last_location.x
+        dy = loc.y - self._last_location.y
+        dist_moved = math.hypot(dx, dy)
+
+        # If there is a hazard (e.g., strong braking or blocked path)
+        # and we have not moved significantly, increase stuck timer
+        if hazard_detected and dist_moved < 0.1:
+            self._stuck_timer += 1
+        else:
+            # Reset if we are moving or no hazard
+            self._stuck_timer = 0
+
+        # Update last location
+        self._last_location = loc
+
+        # Trigger recovery if we have been stuck for too long
+        if not self._in_recovery and self._stuck_timer > self._stuck_threshold:
+            print(f"Agent {self._vehicle.id}: detected stuck/crash, entering recovery mode.")
+            print(f"Agent {self._vehicle.id}: detected stuck/crash, entering recovery mode.")
+            self._start_recovery()
+
+    def _start_recovery(self):
+        """
+        Initiates the recovery maneuver.
+        """
+        self._in_recovery = True
+        self._recovery_state = 'REVERSE'
+        self._recovery_counter = 30 # Reverse for ~1.5 seconds
 
     def emergency_stop(self):
         """
@@ -686,7 +647,7 @@ class BehaviorAgent(BasicAgent):
             return min(math.hypot(x - px, y - py) for (px, py) in pts)
 
         # Thresholds
-        min_frontier_dist = 5.0    # ignore frontiers too close to ego
+        min_frontier_dist = 10.0   # ignore frontiers too close to ego
         min_repeat_dist   = 20.0   # ignore frontiers close to previously visited ones
         min_sep_other     = 15.0   # prefer frontiers away from other agents
 

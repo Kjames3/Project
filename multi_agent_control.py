@@ -30,6 +30,7 @@ try:
     from pygame.locals import K_q
     from pygame.locals import K_TAB
     from pygame.locals import K_n
+    from pygame.locals import K_m
 except ImportError:
     raise RuntimeError('cannot import pygame, make sure pygame package is installed')
 
@@ -260,6 +261,8 @@ class KeyboardControl(object):
                     world.hud.notification(f"Switched to Agent {world.active_agent_index}")
                 elif event.key == K_n:
                     world.camera_managers[world.active_agent_index].next_sensor()
+                elif event.key == K_m:
+                    world.hud.toggle_side_view()
 
     @staticmethod
     def _is_quit_shortcut(key):
@@ -292,6 +295,7 @@ class HUD(object):
         self._show_info = True
         self._info_text = []
         self._server_clock = pygame.time.Clock()
+        self.show_lidar = False
 
     def on_world_tick(self, timestamp):
         """Gets informations from the world at every tick"""
@@ -375,6 +379,12 @@ class HUD(object):
         """Toggle info on or off"""
         self._show_info = not self._show_info
 
+    def toggle_side_view(self):
+        """Toggle side view between Map and LiDAR"""
+        self.show_lidar = not self.show_lidar
+        mode = "LiDAR" if self.show_lidar else "Map"
+        self.notification(f"Side View: {mode}")
+
     def notification(self, text, seconds=2.0):
         """Notification text"""
         self._notifications.set_text(text, seconds=seconds)
@@ -423,96 +433,137 @@ class HUD(object):
         self._notifications.render(display)
         self.help.render(display)
 
-    def render_side_map(self, display, fusion_server, players):
+    def render_side_map(self, display, fusion_server, players, active_agent_index):
         """
         Renders the global occupancy grid and trajectories to the right side of the screen.
         """
-        global_map = fusion_server.get_global_map()
-        if global_map is None:
-            return
+        
+        # Surface for the Side View (Same size as Camera View)
+        side_surface = pygame.Surface(self.dim)
+        side_surface.fill((50, 50, 50)) # Default Gray
+        
+        if self.show_lidar:
+             # --- RENDER LIDAR ---
+             # Get the active agent's LiDAR data
+             # We need to access the agent's sensor data.
+             # The 'players' list contains carla.Vehicle actors.
+             # The 'BehaviorAgent' instances are in 'agents' list in game_loop, but not passed here.
+             # However, we can try to get the sensor data from the world.camera_managers if we had access.
+             # But wait, CameraManager handles camera/lidar for the MAIN view.
+             # We need to access the LiDAR sensor we spawned in game_loop.
+             # In game_loop, we spawned sensors and attached them to players.
+             # But we didn't store them in a way easily accessible here except maybe via the world object if passed?
+             # 'players' are just actors.
+             
+             # Let's look at how we can get the data.
+             # In game_loop, we have 'agents' list.
+             # We should probably pass 'agents' to this function instead of just 'players' or in addition.
+             # OR, we can use the 'fusion_server' to get the local map of the agent?
+             # The request says "current agents lidar data".
+             # The agent's local mapper has the processed lidar grid.
+             # FusionServer has 'maps' dictionary: agent_id -> local_map
+             
+             if active_agent_index in fusion_server.maps:
+                 local_map = fusion_server.maps[active_agent_index]
+                 # local_map is a grid (H, W) with 0..1 values (log odds or probability?)
+                 # FusionServer.update_map receives 'local_map' from LocalMapper.
+                 # LocalMapper.get_local_map() returns the grid.
+                 
+                 # Render Local Map
+                 # It's a grid, similar to global map but smaller and centered on agent.
+                 # But wait, the user asked for "LiDAR data", which usually means points.
+                 # However, "LiDAR data" in this context of "bev map" might mean the local occupancy grid.
+                 # Given the "bev map" context, showing the local grid seems appropriate and easier given the architecture.
+                 # If we want raw points, we'd need to hook into the sensor callback which is in game_loop.
+                 
+                 # Let's render the LOCAL MAP from FusionServer.
+                 
+                 # Normalize and colorize
+                 # Assuming local_map is probability 0..1
+                 h, w = local_map.shape
+                 rgb_map = np.zeros((h, w, 3), dtype=np.uint8)
+                 rgb_map[(local_map > 0.45) & (local_map < 0.55)] = [50, 50, 50]
+                 rgb_map[local_map <= 0.45] = [0, 0, 0]
+                 rgb_map[local_map >= 0.55] = [255, 255, 255]
+                 
+                 temp_surf = pygame.surfarray.make_surface(rgb_map.swapaxes(0, 1))
+                 
+                 # Scale to fit side view
+                 scaled_surf = pygame.transform.scale(temp_surf, self.dim)
+                 side_surface.blit(scaled_surf, (0, 0))
+                 
+                 # Draw Agent Arrow in Center
+                 cx, cy = self.dim[0] // 2, self.dim[1] // 2
+                 pygame.draw.circle(side_surface, (0, 255, 0), (cx, cy), 5)
+                 pygame.draw.line(side_surface, (0, 255, 0), (cx, cy), (cx, cy - 15), 2) # Facing up
+                 
+                 # Overlay text
+                 label = self._font_mono.render(f"Agent {active_agent_index} Local Map", True, (255, 255, 0))
+                 side_surface.blit(label, (10, 10))
+                 
+             else:
+                 label = self._font_mono.render("No LiDAR Data", True, (255, 0, 0))
+                 side_surface.blit(label, (10, 10))
 
-        # Surface for the Map (Same size as Camera View)
-        map_surface = pygame.Surface(self.dim)
-        map_surface.fill((50, 50, 50)) # Default Gray (Unknown)
-        
-        # 1. Render Grid
-        # Create RGB image buffer
-        h, w = global_map.shape
-        rgb_map = np.zeros((h, w, 3), dtype=np.uint8)
-        
-        # Color Scheme
-        # Unknown (approx 0.5) -> Gray (50, 50, 50)
-        unknown_mask = (global_map > 0.45) & (global_map < 0.55)
-        rgb_map[unknown_mask] = [50, 50, 50]
-        
-        # Free (< 0.45) -> Black (0, 0, 0)
-        free_mask = global_map <= 0.45
-        rgb_map[free_mask] = [0, 0, 0]
-        
-        # Occupied (>= 0.55) -> White (255, 255, 255)
-        occ_mask = global_map >= 0.55
-        rgb_map[occ_mask] = [255, 255, 255]
-        
-        # Create Pygame Surface
-        # Pygame expects (W, H, 3) but numpy is (H, W, 3). Swap axes.
-        surf_array = rgb_map.swapaxes(0, 1)
-        temp_surf = pygame.surfarray.make_surface(surf_array)
-        
-        # Scale to fit
-        scale = self.dim[1] / fusion_server.grid_dim
-        map_w = int(fusion_server.grid_dim * scale)
-        map_h = int(fusion_server.grid_dim * scale)
-        
-        offset_x = (self.dim[0] - map_w) // 2
-        offset_y = 0
-        
-        scaled_surf = pygame.transform.scale(temp_surf, (map_w, map_h))
-        map_surface.blit(scaled_surf, (offset_x, offset_y))
-        
-        # Helper for coordinate transform
-        def to_screen(gx, gy):
-            # Global -> Grid
-            r = (fusion_server.max_x - gx) / fusion_server.grid_size
-            c = (gy - fusion_server.min_y) / fusion_server.grid_size
-            # Grid -> Screen
-            sx = offset_x + int(c * scale)
-            sy = offset_y + int(r * scale)
-            return sx, sy
+        else:
+            # --- RENDER GLOBAL MAP (Existing Logic) ---
+            global_map = fusion_server.get_global_map()
+            if global_map is not None:
+                # 1. Render Grid (Optimized with Numba)
+                scale = self.dim[1] / fusion_server.grid_dim
+                map_w = int(fusion_server.grid_dim * scale)
+                map_h = int(fusion_server.grid_dim * scale)
+                
+                offset_x = (self.dim[0] - map_w) // 2
+                offset_y = 0
+                
+                # Get rendered image directly from FusionServer
+                rgb_map = fusion_server.get_map_image(map_w, map_h)
+                
+                temp_surf = pygame.surfarray.make_surface(rgb_map)
+                side_surface.blit(temp_surf, (offset_x, offset_y))
+                
+                # Helper for coordinate transform
+                def to_screen(gx, gy):
+                    # Global -> Grid
+                    r = (fusion_server.max_x - gx) / fusion_server.grid_size
+                    c = (gy - fusion_server.min_y) / fusion_server.grid_size
+                    # Grid -> Screen
+                    sx = offset_x + int(c * scale)
+                    sy = offset_y + int(r * scale)
+                    return sx, sy
 
-        # 2. Draw Trajectories
-        for agent_id, traj in fusion_server.trajectories.items():
-            if len(traj) > 1:
-                # OPTIMIZATION: Slice traj[::10] to draw only every 10th point
-                points = [to_screen(p[0], p[1]) for p in traj[::10]]
-                if len(points) > 1:
-                    color = (0, 255, 255) if agent_id == 0 else (255, 0, 255)
-                    pygame.draw.lines(map_surface, color, False, points, 2)
+                # 2. Draw Trajectories
+                for agent_id, traj in fusion_server.trajectories.items():
+                    if len(traj) > 1:
+                        # OPTIMIZATION: Slice traj[::10] to draw only every 10th point
+                        points = [to_screen(p[0], p[1]) for p in traj[::10]]
+                        if len(points) > 1:
+                            color = (0, 255, 255) if agent_id == 0 else (255, 0, 255)
+                            pygame.draw.lines(side_surface, color, False, points, 2)
 
-        # 3. Draw Agents
-        for i, player in enumerate(players):
-            t = player.get_transform()
-            sx, sy = to_screen(t.location.x, t.location.y)
-            
-            color = (0, 0, 255) if i == 0 else (255, 0, 0)
-            pygame.draw.circle(map_surface, color, (sx, sy), 5)
-            
-            # Heading
-            rad = math.radians(t.rotation.yaw)
-            vx = math.cos(rad)
-            vy = math.sin(rad)
-            # Screen vector:
-            # x_s ~ c ~ y_g
-            # y_s ~ r ~ -x_g
-            dx = vy * 15
-            dy = -vx * 15
-            pygame.draw.line(map_surface, (255, 255, 0), (sx, sy), (sx + dx, sy + dy), 2)
-            
-            # Label
-            label = self._font_mono.render(f"A{i}", True, (255, 255, 255))
-            map_surface.blit(label, (sx + 10, sy - 10))
+                # 3. Draw Agents
+                for i, player in enumerate(players):
+                    t = player.get_transform()
+                    sx, sy = to_screen(t.location.x, t.location.y)
+                    
+                    color = (0, 0, 255) if i == 0 else (255, 0, 0)
+                    pygame.draw.circle(side_surface, color, (sx, sy), 5)
+                    
+                    # Heading
+                    rad = math.radians(t.rotation.yaw)
+                    vx = math.cos(rad)
+                    vy = math.sin(rad)
+                    dx = vy * 15
+                    dy = -vx * 15
+                    pygame.draw.line(side_surface, (255, 255, 0), (sx, sy), (sx + dx, sy + dy), 2)
+                    
+                    # Label
+                    label = self._font_mono.render(f"A{i}", True, (255, 255, 255))
+                    side_surface.blit(label, (sx + 10, sy - 10))
 
         # Blit to Right Side of Main Display
-        display.blit(map_surface, (self.dim[0], 0))
+        display.blit(side_surface, (self.dim[0], 0))
         
         # Draw Separator
         pygame.draw.line(display, (255, 255, 255), (self.dim[0], 0), (self.dim[0], self.dim[1]), 2)
@@ -710,6 +761,7 @@ class CameraManager(object):
         bound_z = 0.5 + self._parent.bounding_box.extent.z
         attachment = carla.AttachmentType
         self._camera_transforms = [
+            (carla.Transform(carla.Location(x=-3.5*bound_x, y=+0.0*bound_y, z=2.5*bound_z), carla.Rotation(pitch=-8.0)), attachment.SpringArmGhost),
             (carla.Transform(carla.Location(x=-2.0*bound_x, y=+0.0*bound_y, z=2.0*bound_z), carla.Rotation(pitch=8.0)), attachment.SpringArmGhost),
             (carla.Transform(carla.Location(x=+0.8*bound_x, y=+0.0*bound_y, z=1.3*bound_z)), attachment.Rigid),
             (carla.Transform(carla.Location(x=+1.9*bound_x, y=+1.0*bound_y, z=1.2*bound_z)), attachment.SpringArmGhost),
@@ -718,7 +770,7 @@ class CameraManager(object):
             (carla.Transform(carla.Location(x=-5.0, z=2.5), carla.Rotation(pitch=-10.0)), attachment.SpringArmGhost),
             ]
 
-        self.transform_index = 1
+        self.transform_index = 0
         self.sensors = [
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB'],
             ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)'],
@@ -897,7 +949,7 @@ class CameraManager(object):
 # -- Game Loop ---------------------------------------------------------
 # ==============================================================================
 
-
+# @profile
 def game_loop(args):
     """
     Main loop of the simulation.
@@ -971,8 +1023,8 @@ def game_loop(args):
         clock = pygame.time.Clock()
         frame_count = 0
         MAPPING_FREQUENCY = 20 # Increase to reduce load
-        VISUALIZATION_FREQUENCY = 10 # Increase to reduce load
-        VISUALIZATION_FREQUENCY = 10
+        VISUALIZATION_FREQUENCY = 20 # Update side view every 20 frames
+        WARMUP_FRAMES = 40
 
         while True:
             clock.tick_busy_loop(60)
@@ -980,8 +1032,16 @@ def game_loop(args):
                 return
 
             frame_count += 1
-            # Asynchronous update
             world.tick(clock)
+
+            # --- WARMUP CHECK ---
+            if frame_count < WARMUP_FRAMES:
+                # Just render the world so we can see, but don't run agents/mapping
+                world.render(display)
+                pygame.display.flip()
+                continue # Skip the rest of the loop
+            
+            # Asynchronous update
             
             # Update Virtual Sensor (BEV Map) if active
             cm = world.camera_managers[world.active_agent_index]
@@ -1038,7 +1098,7 @@ def game_loop(args):
             # Render Global Map
             # Render Side Map (Right Side)
             if frame_count % VISUALIZATION_FREQUENCY == 0:
-                world.hud.render_side_map(display, fusion_server, world.players)
+                world.hud.render_side_map(display, fusion_server, world.players, world.active_agent_index)
             
             # LOGGING FOR REPORT
             if frame_count % 100 == 0:
