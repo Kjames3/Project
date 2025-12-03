@@ -1166,7 +1166,7 @@ def game_loop(args):
                 print(f"Total Area Mapped: {area:.2f} square meters")
 
                 # 2. Save Map
-                fusion_server.save_map_to_disk("mission_report_map.png")
+                fusion_server.save_map_to_disk("/Pictures/mission_report_map.png")
 
             # 3. Clean up
             print("Cleaning up sensors...")
