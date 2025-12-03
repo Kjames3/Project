@@ -510,17 +510,19 @@ class HUD(object):
             global_map = fusion_server.get_global_map()
             if global_map is not None:
                 # 1. Render Grid (Optimized with Numba)
-                scale = self.dim[1] / fusion_server.grid_dim
+                ZOOM = 2.0
+                scale = (self.dim[1] / fusion_server.grid_dim) * ZOOM
                 map_w = int(fusion_server.grid_dim * scale)
                 map_h = int(fusion_server.grid_dim * scale)
                 
-                offset_x = (self.dim[0] - map_w) // 2
-                offset_y = 0
-                
                 # Get rendered image directly from FusionServer
                 rgb_map = fusion_server.get_map_image(map_w, map_h)
-                
                 temp_surf = pygame.surfarray.make_surface(rgb_map)
+                
+                # Center the map in the view
+                offset_x = (self.dim[0] - map_w) // 2
+                offset_y = (self.dim[1] - map_h) // 2
+                
                 side_surface.blit(temp_surf, (offset_x, offset_y))
                 
                 # Helper for coordinate transform
@@ -773,9 +775,9 @@ class CameraManager(object):
         self.transform_index = 0
         self.sensors = [
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB'],
-            ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)'],
-            ['sensor.camera.semantic_segmentation', cc.CityScapesPalette,
-             'Camera Semantic Segmentation (CityScapes Palette)'],
+            # ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)'],
+            # ['sensor.camera.semantic_segmentation', cc.CityScapesPalette,
+            #  'Camera Semantic Segmentation (CityScapes Palette)'],
             ['sensor.lidar.ray_cast_semantic', None, 'Lidar (Semantic Ray-Cast)'],
             ['virtual_bev_map', None, 'Occupancy Grid Map']]
         world = self._parent.get_world()
