@@ -41,47 +41,6 @@ def fast_fusion_update(log_odds_map, local_indices_r, local_indices_c,
         if 0 <= global_r < grid_dim and 0 <= global_c < grid_dim:
             log_odds_map[global_r, global_c] += update_val
 
-@jit(nopython=True)
-def _render_map_jit(log_odds_map, output_image):
-    # output_image is (W, H, 3) for Pygame
-    out_w, out_h, _ = output_image.shape
-    map_h, map_w = log_odds_map.shape # Grid is (Rows, Cols)
-    
-    scale_x = map_w / out_w
-    scale_y = map_h / out_h
-    
-    for x in range(out_w):
-        for y in range(out_h):
-            # Map x (col) -> mc
-            # Map y (row) -> mr
-            mc = int(x * scale_x)
-            mr = int(y * scale_y)
-            
-            if mr >= 0 and mr < map_h and mc >= 0 and mc < map_w:
-                l_val = log_odds_map[mr, mc]
-                
-                # Sigmoid: p = 1 / (1 + exp(-l))
-                # Optimization: check sign of l_val first to avoid exp?
-                # Or just do it.
-                prob = 1.0 / (1.0 + np.exp(-l_val))
-                
-                # Color
-                if prob < 0.45:
-                    # Free -> Black
-                    output_image[x, y, 0] = 0
-                    output_image[x, y, 1] = 0
-                    output_image[x, y, 2] = 0
-                elif prob > 0.55:
-                    # Occupied -> White
-                    output_image[x, y, 0] = 255
-                    output_image[x, y, 1] = 255
-                    output_image[x, y, 2] = 255
-                else:
-                    # Unknown -> Gray
-                    output_image[x, y, 0] = 50
-                    output_image[x, y, 1] = 50
-                    output_image[x, y, 2] = 50
-
 class FusionServer(object):
     """
     FusionServer acts as a central authority for merging local maps from multiple agents.
@@ -106,6 +65,10 @@ class FusionServer(object):
         # 0.0 = Unknown (p=0.5, log(1) = 0)
         self.log_odds_map = np.zeros((self.grid_dim, self.grid_dim), dtype=np.float32)
         
+        # Caching
+        self._cached_prob_map = None
+        self._map_dirty = True
+
         # Constants for Log-Odds
         self.l_occ = np.log(0.7 / 0.3)  # p(occ) = 0.7
         self.l_free = np.log(0.4 / 0.6) # p(free) = 0.4
@@ -137,12 +100,15 @@ class FusionServer(object):
         # Occupied: > 0.55
         occ_indices = np.where(local_occupancy_grid > 0.55)
         
+        updated = False
+
         # Process Free
         if len(free_indices[0]) > 0:
             fast_fusion_update(self.log_odds_map, free_indices[0], free_indices[1], 
                                pose[0], pose[1], np.radians(pose[2]), self.grid_size, 
                                self.max_x, self.min_y, self.grid_dim, 
                                local_center, self.l_free)
+            updated = True
                            
         # Process Occupied
         if len(occ_indices[0]) > 0:
@@ -150,6 +116,10 @@ class FusionServer(object):
                                pose[0], pose[1], np.radians(pose[2]), self.grid_size, 
                                self.max_x, self.min_y, self.grid_dim, 
                                local_center, self.l_occ)
+            updated = True
+
+        if updated:
+            self._map_dirty = True
 
     def update_trajectory(self, agent_id, pose):
         """
@@ -179,16 +149,83 @@ class FusionServer(object):
         Returns the current fused global map as probabilities.
         :return: 2D numpy array representing the global occupancy grid (0.0-1.0)
         """
-        return 1.0 / (1.0 + np.exp(-self.log_odds_map))
+        if self._map_dirty or self._cached_prob_map is None:
+            self._cached_prob_map = 1.0 / (1.0 + np.exp(-self.log_odds_map))
+            self._map_dirty = False
+
+        return self._cached_prob_map
         
     def get_map_image(self, width, height):
         """
         Returns a rendered RGB image of the map, scaled to width x height.
         :return: Numpy array (width, height, 3) ready for pygame.surfarray.make_surface
         """
-        output_image = np.zeros((width, height, 3), dtype=np.uint8)
-        _render_map_jit(self.log_odds_map, output_image)
-        return output_image
+        # Optimized: Use pre-computed probability map and vectorized ops
+        probs = self.get_global_map()
+
+        # 1. Generate full-res RGB map
+        # Note: We allocate new array, but it's faster than per-pixel exp in python loop
+        rgb_map = np.zeros((self.grid_dim, self.grid_dim, 3), dtype=np.uint8)
+
+        # Colors
+        # Unknown (0.45 - 0.55) -> Gray
+        rgb_map[(probs > 0.45) & (probs < 0.55)] = [50, 50, 50]
+        # Free (<= 0.45) -> Black
+        rgb_map[probs <= 0.45] = [0, 0, 0]
+        # Occupied (>= 0.55) -> White
+        rgb_map[probs >= 0.55] = [255, 255, 255]
+
+        # 2. Resize to target size
+        # Use cv2 if available (much faster than manual or pygame usually)
+        # But we must match (Width, Height) format.
+        # rgb_map is (Rows, Cols, 3) -> (Height, Width, 3).
+        # cv2.resize expects (dest_width, dest_height).
+
+        # Swap axes to match Pygame logic (Width, Height) if needed?
+        # Original code:
+        # out_w, out_h = output_image.shape
+        # map_h, map_w = log_odds_map.shape
+        # for x in range(out_w): for y in range(out_h): mc = x*scale; mr = y*scale.
+        # So output is (Width, Height).
+        # We need to return (Width, Height, 3).
+
+        # Input rgb_map is (GridH, GridW, 3).
+        # We want Output (TargetW, TargetH, 3).
+        # But cv2.resize takes image (H, W, C).
+        # And target size (TargetW, TargetH).
+        # Result is (TargetH, TargetW, C).
+        # We need (TargetW, TargetH, C).
+
+        # So we transpose input to (GridW, GridH, 3).
+        rgb_map_t = rgb_map.transpose(1, 0, 2)
+
+        # Resize to (TargetH, TargetW) -> resulting shape (TargetW, TargetH, 3)?
+        # No, cv2.resize(src, dsize=(width, height)).
+        # Src is (H, W, C).
+        # Dsize is (TargetW, TargetH). (This sets columns, rows).
+        # Result is (TargetH, TargetW, C).
+
+        # If we want result (TargetW, TargetH, C):
+        # We should pass Src (TargetW_source, TargetH_source, C).
+        # Dsize (TargetH, TargetW).
+        # Result (TargetW, TargetH, C).
+
+        # Let's stick to standard image convention:
+        # Image is (H, W, C).
+        # We resize to (TargetH, TargetW).
+        # Then transpose to (TargetW, TargetH, C) for Pygame.
+
+        resized = cv2.resize(rgb_map, (height, width), interpolation=cv2.INTER_NEAREST)
+        # resized shape is (width, height, 3).
+
+        # Wait, if we want (Width, Height, 3).
+        # cv2.resize(src, (height, width)).
+        # Dsize is (cols, rows) -> (height, width).
+        # Result cols=height, rows=width.
+        # Shape (width, height, 3).
+        # Yes.
+
+        return resized
 
     def calculate_coverage(self):
         """Calculates mapped area in square meters"""

@@ -17,13 +17,10 @@ import math
 @njit(fastmath=True)
 def voxel_filter(points, voxel_size):
     """
-    Returns indices of points that are unique within a voxel grid.
+    Returns discretized integer voxel indices.
     """
     # 1. Discretize coords to integer voxel indices
     voxel_indices = np.floor(points / voxel_size).astype(np.int32)
-    
-    # 2. We can't use np.unique with axis in Numba easily,
-    # so we return voxel_indices to python for unique processing
     return voxel_indices
 
 @njit(fastmath=True)
@@ -42,14 +39,6 @@ def fast_raycast(grid, center_r, center_c, end_r, end_c):
         
         while True:
             # Set pixel to 1 (Free)
-            # Note: The original code used 255 for free in a uint8 mask.
-            # The user's snippet sets grid[r0, c0] = 1.
-            # We should ensure 'grid' is passed as the mask (uint8) or the map itself?
-            # The original code used a separate 'free_mask' (uint8) and drew lines with 255.
-            # Then set self.local_map[free_mask > 0] = 0.0.
-            # If we pass 'free_mask' to this function, we should set it to 1 (or 255).
-            # Let's stick to the user's snippet 'grid[r0, c0] = 1' and assume we pass a zero-initialized grid.
-            # We can then use this grid to update self.local_map.
             grid[r0, c0] = 1 
             
             if r0 == r1 and c0 == c1:
@@ -82,8 +71,6 @@ def get_matrix(transform):
     roll = math.radians(transform.rotation.roll)
 
     # Rotation Matrix (Yaw * Pitch * Roll) - Standard CARLA (Unreal) convention
-    # But usually we just need Yaw for 2D, but let's do full.
-    # CR = cos(roll), SR = sin(roll), etc.
     cy = math.cos(yaw)
     sy = math.sin(yaw)
     cp = math.cos(pitch)
@@ -189,14 +176,37 @@ class LocalMapper(object):
                 print(f"LocalMapper Error: Failed to transform points: {e}")
         # ----------------------------------------
 
-        # --- NEW: DOWNSAMPLING STEP ---
+        # --- OPTIMIZED: DOWNSAMPLING STEP ---
         # Quantize points to 10cm voxels
         voxel_size = 0.1
         quantized = voxel_filter(points, voxel_size)
         
-        # Keep only unique voxels (Standard Numpy is fast enough for this step)
-        # np.unique with axis=0 returns unique rows
-        _, unique_indices = np.unique(quantized, axis=0, return_index=True)
+        # Optimization: Use 1D hashing for fast unique filtering
+        # Assuming points are within +/- 200m
+        # int32 range is +/- 2 billion.
+        # Indices around +/- 2000.
+        # Packed index: x + y*MAX_WIDTH + z*MAX_WIDTH*MAX_HEIGHT
+
+        # Shift to positive range to avoid negative modulo/hash issues (though numpy handles negatives)
+        # Offset 5000 is enough for 500m range
+        offset = 5000
+
+        # Limit the coordinates to avoid overflow/index errors
+        # Note: 'quantized' is int32.
+        # We cast to int64 for packing to be safe.
+
+        q_x = quantized[:, 0].astype(np.int64) + offset
+        q_y = quantized[:, 1].astype(np.int64) + offset
+        q_z = quantized[:, 2].astype(np.int64) + offset
+
+        # Multipliers
+        # X range ~10000. Y range ~10000.
+        mul_y = 10000
+        mul_z = 100000000
+
+        packed = q_x + q_y * mul_y + q_z * mul_z
+
+        _, unique_indices = np.unique(packed, return_index=True)
         
         # Filter data
         points = points[unique_indices]
@@ -235,11 +245,18 @@ class LocalMapper(object):
         
         # Unique endpoints to optimize raycasting
         # Use (row, col) for Numba function
-        unique_endpoints = np.unique(np.column_stack((valid_r, valid_c)), axis=0)
+        # OPTIMIZATION: Also use 1D hashing for this unique check
+        # But indices are small here (0..80).
+        # Standard unique is fine, but we can use:
+        # packed_endpoints = valid_r * grid_dim + valid_c
+        # _, unique_ep_idx = np.unique(packed_endpoints, return_index=True)
+
+        packed_endpoints = valid_r.astype(np.int32) * self.grid_dim + valid_c.astype(np.int32)
+        _, unique_ep_idx = np.unique(packed_endpoints, return_index=True)
         
-        if len(unique_endpoints) > 0:
-            end_r = unique_endpoints[:, 0]
-            end_c = unique_endpoints[:, 1]
+        if len(unique_ep_idx) > 0:
+            end_r = valid_r[unique_ep_idx]
+            end_c = valid_c[unique_ep_idx]
             fast_raycast(free_mask, self.center_idx, self.center_idx, end_r, end_c)
             
         # 2. Mark Occupied Cells
