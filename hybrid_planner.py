@@ -139,27 +139,56 @@ class HybridRoutePlanner(object):
 
         return False
 
-    def get_frontiers(self):
+    def get_frontiers(self, ego_location=None, search_radius=50.0):
         """
         Scans the global map to find frontiers (edges between Free and Unknown space).
+        Optimized: Only search for frontiers within 'search_radius' meters of the agent.
         
+        :param ego_location: carla.Location or tuple (x, y) of the agent.
+        :param search_radius: Radius in meters to search around the agent.
         :return: List of (x, y) tuples in global coordinates representing frontier points.
         """
         global_map = self._fusion_server.get_global_map()
         if global_map is None:
             return []
 
-        # 1. Define Masks
+        # 1. Determine Bounding Box Indices
+        if ego_location:
+            # Handle potential carla.Location input
+            ex = ego_location.x if hasattr(ego_location, 'x') else ego_location[0]
+            ey = ego_location.y if hasattr(ego_location, 'y') else ego_location[1]
+            
+            # Convert world loc to grid indices
+            # Row = (Max_X - X) / res
+            # Col = (Y - Min_Y) / res
+            cx = int((self._fusion_server.max_x - ex) / self._fusion_server.grid_size)
+            cy = int((ey - self._fusion_server.min_y) / self._fusion_server.grid_size)
+            
+            rad_cells = int(search_radius / self._fusion_server.grid_size)
+            
+            r_min = max(0, cx - rad_cells)
+            r_max = min(self._fusion_server.grid_dim, cx + rad_cells)
+            c_min = max(0, cy - rad_cells)
+            c_max = min(self._fusion_server.grid_dim, cy + rad_cells)
+            
+            # Slice the map (Zero-copy view)
+            local_view = global_map[r_min:r_max, c_min:c_max]
+        else:
+            local_view = global_map
+            r_min, c_min = 0, 0
+
+        # 2. Define Masks on the SMALLER slice
         # Free: < 0.4
         # Unknown: 0.4 <= p <= 0.6
         # Occupied: > 0.6
         
-        free_mask = (global_map < 0.4).astype(np.uint8)
-        unknown_mask = ((global_map >= 0.4) & (global_map <= 0.6)).astype(np.uint8)
+        free_mask = (local_view < 0.4).astype(np.uint8)
+        # Note: 1 is Free in the mask used for logic usually, but here 1 means True
         
-        # 2. Find Frontiers
+        unknown_mask = ((local_view >= 0.4) & (local_view <= 0.6)).astype(np.uint8)
+        
+        # 3. Find Frontiers
         # Frontier pixels are Free pixels that are adjacent to Unknown pixels.
-        # We can dilate Unknown mask and intersect with Free mask.
         
         import cv2
         kernel = np.ones((3, 3), np.uint8)
@@ -167,12 +196,16 @@ class HybridRoutePlanner(object):
         
         frontier_mask = (free_mask == 1) & (dilated_unknown == 1)
         
-        # 3. Extract Coordinates
-        # Indices (r, c)
+        # 4. Extract Coordinates (relative to slice)
         frontier_indices = np.argwhere(frontier_mask)
         
         if len(frontier_indices) == 0:
             return []
+            
+        # 5. Adjust indices back to global
+        if ego_location:
+            frontier_indices[:, 0] += r_min
+            frontier_indices[:, 1] += c_min
             
         # Downsample if too many?
         # Or cluster them. For now, return all (or a subset).

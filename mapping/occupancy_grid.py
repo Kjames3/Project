@@ -14,6 +14,18 @@ import cv2
 from numba import njit
 
 @njit(fastmath=True)
+def voxel_filter(points, voxel_size):
+    """
+    Returns indices of points that are unique within a voxel grid.
+    """
+    # 1. Discretize coords to integer voxel indices
+    voxel_indices = np.floor(points / voxel_size).astype(np.int32)
+    
+    # 2. We can't use np.unique with axis in Numba easily,
+    # so we return voxel_indices to python for unique processing
+    return voxel_indices
+
+@njit(fastmath=True)
 def fast_raycast(grid, center_r, center_c, end_r, end_c):
     """Bresenham's Line Algorithm optimized with Numba"""
     # Loop through all unique endpoints
@@ -95,6 +107,20 @@ class LocalMapper(object):
 
         points = np.column_stack((data['x'], data['y'], data['z']))
         tags = data['tag']
+
+        # --- NEW: DOWNSAMPLING STEP ---
+        # Quantize points to 10cm voxels
+        voxel_size = 0.1
+        quantized = voxel_filter(points, voxel_size)
+        
+        # Keep only unique voxels (Standard Numpy is fast enough for this step)
+        # np.unique with axis=0 returns unique rows
+        _, unique_indices = np.unique(quantized, axis=0, return_index=True)
+        
+        # Filter data
+        points = points[unique_indices]
+        tags = tags[unique_indices]
+        # ------------------------------
 
         # Coordinate Conversion: Sensor Frame -> Grid Frame
         # Sensor Frame: x=forward, y=right, z=up (CARLA standard)

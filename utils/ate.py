@@ -112,8 +112,22 @@ class AbsoluteTrajectoryError:
     def compute_trajectory_error(self):
         """Compute ATE between aligned trajectories"""
         # Ensure arrays are float64 for Numba
+        
+        # DEBUG: Print shapes
+        # print(f"DEBUG: traj_est shape: {self.traj_est.shape}")
+        # print(f"DEBUG: traj_gt shape: {self.traj_gt.shape}")
+
+        if len(self.traj_est.shape) == 1:
+            self.traj_est = self.traj_est.reshape(-1, 7)
+        if len(self.traj_gt.shape) == 1:
+            self.traj_gt = self.traj_gt.reshape(-1, 7)
+
         est = self.traj_est.astype(np.float64)
         gt = self.traj_gt.astype(np.float64)
+        
+        # Verify Numba-compatible array (C-contiguous usually helps)
+        est = np.ascontiguousarray(est)
+        gt = np.ascontiguousarray(gt)
         
         p_errs, r_errs = fast_compute_errors(est, gt)
         

@@ -141,10 +141,10 @@ class World(object):
             color = random.choice(blueprint.get_attribute('color').recommended_values)
             blueprint.set_attribute('color', color)
 
-        # Spawn Agents
         if self.players:
             self.destroy()
             self.players = []
+            self.camera_managers = [] # Clear camera managers list
 
         spawn_points = self.map.get_spawn_points()
         if len(spawn_points) < self._args.number_of_agents:
@@ -169,17 +169,13 @@ class World(object):
             self.world.wait_for_tick()
 
         # Set up the sensors for EACH player
-        for player in self.players:
+        # Set up the sensors for EACH player
+        for i, player in enumerate(self.players):
             self.collision_sensors.append(CollisionSensor(player, self.hud))
             self.lane_invasion_sensors.append(LaneInvasionSensor(player, self.hud))
             self.gnss_sensors.append(GnssSensor(player))
             # Assuming 'fusion_server' is available in the scope where World is instantiated
             # and passed to the World constructor, or created within World.
-            # For this edit, we assume 'fusion_server' is defined and accessible.
-            # If 'fusion_server' is not defined, this will cause a NameError.
-            # The original code used 'cm' as a local variable for CameraManager.
-            # The requested change uses 'self.camera_manager' and 'self.player' which are inconsistent
-            # with the loop structure and existing class attributes.
             cm = CameraManager(player, self.hud, fusion_server=self.fusion_server)
             cm.set_sensor(cam_index, notify=False)
             self.camera_managers.append(cm)
@@ -211,7 +207,8 @@ class World(object):
     def render(self, display):
         """Render world"""
         # Render the active agent's camera
-        self.camera_managers[self.active_agent_index].render(display)
+        if self.camera_managers and self.active_agent_index < len(self.camera_managers):
+            self.camera_managers[self.active_agent_index].render(display)
         self.hud.render(display)
 
     def destroy_sensors(self):
@@ -311,6 +308,9 @@ class HUD(object):
             return
         
         # Display info for the active agent
+        if not world.players or world.active_agent_index >= len(world.players):
+            return
+
         player = world.players[world.active_agent_index]
         transform = player.get_transform()
         vel = player.get_velocity()
@@ -800,8 +800,10 @@ class CameraManager(object):
             item.append(blp)
         self.index = None
 
+        self.index = None
+
     def toggle_camera(self):
-        """Activate a camera"""
+        """Toggles between RGB, Lidar, and Map"""
         self.transform_index = (self.transform_index + 1) % len(self._camera_transforms)
         self.set_sensor(self.index, notify=False, force_respawn=True)
 
@@ -830,6 +832,7 @@ class CameraManager(object):
         if notify:
             self.hud.notification(self.sensors[index][2])
         self.index = index
+        print(f"Set sensor {index} for Parent {self._parent.id}. Listening...")
 
     def next_sensor(self):
         """Get the next sensor"""
@@ -917,6 +920,10 @@ class CameraManager(object):
         self = weak_self()
         if not self:
             return
+        # DEBUG PRINT
+        # if self.index == 0 and image.frame % 100 == 0:
+        #    print(f"Agent {self._parent.id} Camera Rx: Frame {image.frame}")
+        
         if self.sensors[self.index][0].startswith('sensor.lidar'):
             # Check if image is actually Lidar data (prevent race condition)
             if not isinstance(image, carla.LidarMeasurement):
@@ -1051,8 +1058,10 @@ def game_loop(args):
             # Asynchronous update
             
             # Update Virtual Sensor (BEV Map) if active
-            cm = world.camera_managers[world.active_agent_index]
-            if cm.sensors[cm.index][0] == 'virtual_bev_map':
+            has_camera = world.camera_managers and world.active_agent_index < len(world.camera_managers)
+            cm = world.camera_managers[world.active_agent_index] if has_camera else None
+            
+            if cm and cm.sensors[cm.index][0] == 'virtual_bev_map':
                 # Render map to camera surface
                 # Reuse render_global_map logic but scale to full screen?
                 # Or just use the existing render_global_map but blit to cm.surface
@@ -1166,7 +1175,7 @@ def game_loop(args):
                 print(f"Total Area Mapped: {area:.2f} square meters")
 
                 # 2. Save Map
-                fusion_server.save_map_to_disk("/Pictures/mission_report_map.png")
+                fusion_server.save_map_to_disk("mission_report_map.png")
 
             # 3. Clean up
             print("Cleaning up sensors...")

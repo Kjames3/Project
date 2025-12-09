@@ -55,9 +55,10 @@ class BehaviorAgent(BasicAgent):
         # PID Controller Tuning
         if 'lateral_control_dict' not in opt_dict:
             opt_dict['lateral_control_dict'] = {
-                'type': 'PurePursuit',
+                'type': 'Hybrid',
                 'L': 2.875,
-                'Kdd': 1.5
+                'Kdd': 1.5,
+                'k_stanley': 0.5
             }
         if 'longitudinal_control_dict' not in opt_dict:
             opt_dict['longitudinal_control_dict'] = {
@@ -98,6 +99,26 @@ class BehaviorAgent(BasicAgent):
 
         elif behavior == 'aggressive':
             self._behavior = Aggressive()
+
+        # Hybrid Planner and Local Mapper placeholders
+        self._hybrid_planner = None
+        self._local_mapper = None
+        self._last_location = None
+        self._stuck_timer = 0
+        self._stuck_threshold = 200 # ticks
+        self._in_recovery = False
+        self._recovery_state = None
+        self._recovery_counter = 0
+
+        # Fusion
+        if fusion_server:
+            from hybrid_planner import HybridRoutePlanner
+            # from mapping.occupancy_grid import LocalMapper # Moved below
+            self._hybrid_planner = HybridRoutePlanner(fusion_server, self._map)
+            # ... (rest of fusion init)
+        
+        # We need LocalMapper regardless for run_step processing
+        from mapping.occupancy_grid import LocalMapper
 
         # Initalize Odometry
         self._odometry = Odometry()
@@ -307,7 +328,7 @@ class BehaviorAgent(BasicAgent):
 
         return walker_state, walker, distance
 
-    def car_following_manager(self, vehicle, distance, debug=False):
+    def car_following_manager(self, vehicle, distance, debug=False, dt=None):
         """
         Module in charge of car-following behaviors when there's
         someone in front of us.
@@ -496,6 +517,7 @@ class BehaviorAgent(BasicAgent):
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
             if distance < self._behavior.braking_distance:
+                print(f"Agent {self._vehicle.id}: Emergency Stop! Pedestrian nearby ({distance:.2f}m).")
                 self._update_stuck_status(True)
                 return self.emergency_stop()
 
@@ -508,10 +530,11 @@ class BehaviorAgent(BasicAgent):
                     self._vehicle.bounding_box.extent.y, self._vehicle.bounding_box.extent.x)
 
             if distance < self._behavior.braking_distance:
+                print(f"Agent {self._vehicle.id}: Emergency Stop! Vehicle {vehicle.id} nearby ({distance:.2f}m).")
                 self._update_stuck_status(True)
                 return self.emergency_stop()
             else:
-                control = self.car_following_manager(vehicle, distance)
+                control = self.car_following_manager(vehicle, distance, dt=dt)
 
         # 5.4: Intersection behavior
         elif self._incoming_waypoint.is_junction and \
@@ -587,8 +610,7 @@ class BehaviorAgent(BasicAgent):
 
         # Trigger recovery if we have been stuck for too long
         if not self._in_recovery and self._stuck_timer > self._stuck_threshold:
-            print(f"Agent {self._vehicle.id}: detected stuck/crash, entering recovery mode.")
-            print(f"Agent {self._vehicle.id}: detected stuck/crash, entering recovery mode.")
+            print(f"Agent {self._vehicle.id}: detected stuck/crash (Timer={self._stuck_timer}, Dist={dist_moved:.3f}), entering recovery mode.")
             self._start_recovery()
 
     def _start_recovery(self):
@@ -622,11 +644,12 @@ class BehaviorAgent(BasicAgent):
         if not self._hybrid_planner:
             return False
 
-        frontiers = self._hybrid_planner.get_frontiers()
+        ego_loc = self._vehicle.get_location()
+        # Use optimized bounding box search (50m radius)
+        frontiers = self._hybrid_planner.get_frontiers(ego_location=ego_loc, search_radius=50.0)
+        
         if not frontiers:
             return False
-
-        ego_loc = self._vehicle.get_location()
 
         # Get other agents' latest positions from FusionServer
         other_positions = []

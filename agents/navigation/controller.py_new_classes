@@ -1,0 +1,181 @@
+
+    def set_offset(self, offset):
+        """Changes the offset"""
+        self.offset = offset
+
+class StanleyLateralController(object):
+    """
+    StanleyLateralController implements lateral control using the Stanley controller.
+    """
+
+    def __init__(self, vehicle, k_stanley=0.5, Kdd=1.0):
+        self._vehicle = vehicle
+        self._k_stanley = k_stanley
+        self._Kdd = Kdd # Speed dependent gain (not strictly standard Stanley but useful)
+        self.offset = 0.0
+        self._dt = 1.0 / 20.0 # Default fixed step
+        
+        # Heading error history for integral term (optional, not used in basic Stanley)
+        self._e_heading_sum = 0.0
+
+    def run_step(self, waypoints):
+        """
+        Execute one step of lateral control.
+        :param waypoints: list of (carla.Waypoint, RoadOption) from the LocalPlanner queue
+        """
+        return self._stanley_control(waypoints)
+
+    def _stanley_control(self, waypoints):
+        if not waypoints:
+            return 0.0
+
+        # 1. Get Vehicle State
+        vehicle_transform = self._vehicle.get_transform()
+        vehicle_loc = vehicle_transform.location
+        psi = np.radians(vehicle_transform.rotation.yaw)
+        v_vec = self._vehicle.get_velocity()
+        v = np.sqrt(v_vec.x**2 + v_vec.y**2)
+
+        # 2. Find Nearest Waypoint (Front axle)
+        # Stanley calculates error at the front axle
+        # Simple approximation: Using vehicle center or front axle?
+        # CARLA vehicle.get_location() is center. Front axle is roughly center + L/2 * heading
+        # For simplicity, we can use center but strictly it should be front axle.
+        # Let's project to front axle.
+        
+        # Wheelbase approximate
+        L = 2.875 
+        fx = vehicle_loc.x + (L / 2) * np.cos(psi)
+        fy = vehicle_loc.y + (L / 2) * np.sin(psi)
+        
+        # Find closest waypoint to front axle
+        min_dist = float('inf')
+        closest_wp = waypoints[0][0]
+        
+        for wp_tuple in waypoints:
+            wp = wp_tuple[0]
+            dx = wp.transform.location.x - fx
+            dy = wp.transform.location.y - fy
+            dist = np.sqrt(dx*dx + dy*dy)
+            if dist < min_dist:
+                min_dist = dist
+                closest_wp = wp
+                
+        # 3. Calculate Cross-Track Error (e)
+        # Vector from front axle to waypoint
+        wp_loc = closest_wp.transform.location
+        dx = wp_loc.x - fx
+        dy = wp_loc.y - fy
+        
+        # Project onto normal of path? 
+        # Simplified: cross product (v_head x d_vec)
+        # Only works if we know track heading. 
+        wp_psi = np.radians(closest_wp.transform.rotation.yaw)
+        
+        # Error is distance to the nearest path point, signed
+        # Angle of vector from axle to WP
+        # angle_to_wp = math.atan2(dy, dx)
+        # error_sign = np.sign(np.sin(angle_to_wp - wp_psi)) ??
+        
+        # Standard approach:
+        # e = -d_vec dot normal_vec
+        # better: e = sin(psi_track - atan2(dy, dx)) * dist?
+        # Actually easier: transform (dx, dy) to vehicle frame. y-component is error.
+        # But we need error relative to path.
+        
+        # Let's use the provided simple logic often used in CARLA examples or paper
+        # e = distance. Sign? 
+        # Transform WP location to Vehicle Frame
+        # R_inv = [ [cos, sin], [-sin, cos] ]
+        # local_x = cos * dx + sin * dy
+        # local_y = -sin * dx + cos * dy
+        # local_y is the lateral error relative to vehicle heading.
+        
+        # Better: use map heading.
+        # e is perpendicular distance to path.
+        
+        front_axle_vec = np.array([fx, fy])
+        wp_vec = np.array([wp_loc.x, wp_loc.y])
+        
+        # Normal vector of the road at waypoint
+        # Road heading
+        path_heading = wp_psi
+        
+        # Cross track error
+        # e = (fx - wx) * -sin(path_heading) + (fy - wy) * cos(path_heading)
+        e = (fx - wp_loc.x) * -np.sin(path_heading) + (fy - wp_loc.y) * np.cos(path_heading)
+        
+        # 4. Heading Error (psi_e)
+        psi_e = psi - path_heading
+        # Normalize
+        psi_e = (psi_e + np.pi) % (2 * np.pi) - np.pi
+        
+        # 5. Control Law
+        # delta = psi_e + atan2(k * e, v)
+        # Add offset?
+        
+        # Gain adaptation
+        k = self._k_stanley
+        
+        # Softening term to avoid instability at v=0
+        ks = 1.0 # 1 m/s ?
+        
+        delta = psi_e + np.arctan2(k * e, ks + v)
+        
+        # Clamp
+        delta = np.clip(delta, -1.0, 1.0)
+        
+        return delta
+
+    def change_parameters(self, **kwargs):
+        if 'k_stanley' in kwargs: self._k_stanley = kwargs['k_stanley']
+        if 'Kdd' in kwargs: self._Kdd = kwargs['Kdd']
+    
+    def set_offset(self, offset):
+        self.offset = offset
+
+class HybridLateralController(object):
+    """
+    HybridLateralController blends Pure Pursuit and Stanley.
+    """
+    
+    def __init__(self, vehicle, L=2.875, Kdd=4.0, k_stanley=0.5):
+        self.pp_controller = PurePursuitLateralController(vehicle, L, Kdd)
+        self.stanley_controller = StanleyLateralController(vehicle, k_stanley, Kdd)
+        self._vehicle = vehicle
+        self.offset = 0.0
+
+    def run_step(self, waypoints):
+        # 1. Get both outputs
+        delta_pp = self.pp_controller.run_step(waypoints)
+        delta_st = self.stanley_controller.run_step(waypoints)
+        
+        # 2. Calculate blending weight (w)
+        # Low speed (<10 km/h) -> Mostly Stanley (w near 0)
+        # High speed (>20 km/h) -> Mostly Pure Pursuit (w near 1)
+        
+        v_vec = self._vehicle.get_velocity()
+        vel = np.sqrt(v_vec.x**2 + v_vec.y**2) * 3.6 # km/h
+        
+        # Sigmoid blend
+        # Center at 15 km/h?
+        # np.exp(-0.5 * (vel - 15.0))
+        # w = 1.0 / (1.0 + np.exp(-0.5 * (vel - 15.0)))
+        # At vel=15, w=0.5. At vel=5, exp(-0.5*-10)=exp(5)=148 => w~0. Stanley.
+        # At vel=25, exp(-5) ~ 0 => w~1. Pure Pursuit.
+        
+        w = 1.0 / (1.0 + np.exp(-0.5 * (vel - 15.0)))
+        
+        # 3. Blend
+        delta = w * delta_pp + (1.0 - w) * delta_st
+        
+        return np.clip(delta, -1.0, 1.0)
+        
+    def change_parameters(self, **kwargs):
+        self.pp_controller.change_parameters(**kwargs)
+        self.stanley_controller.change_parameters(**kwargs)
+
+    def set_offset(self, offset):
+        self.pp_controller.set_offset(offset)
+        self.stanley_controller.set_offset(offset)
+

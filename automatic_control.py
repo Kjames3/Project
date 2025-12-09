@@ -62,9 +62,11 @@ import carla
 from carla import ColorConverter as cc
 
 from agents.navigation.behavior_agent import BehaviorAgent  # pylint: disable=import-error
+from agents.navigation.sensor_interface import CallBack # Import CallBack
 from agents.navigation.basic_agent import BasicAgent  # pylint: disable=import-error
 from agents.navigation.constant_velocity_agent import ConstantVelocityAgent  # pylint: disable=import-error
 from agents.navigation.agent_wrapper import AgentWrapper  # pylint: disable=import-error
+from mapping.fusion_server import FusionServer # Import FusionServer
 
 from utils.transform import Transform
 from scipy.spatial.transform import Rotation
@@ -119,7 +121,7 @@ def get_actor_blueprints(world, filter, generation):
 class World(object):
     """ Class representing the surrounding environment """
 
-    def __init__(self, carla_world, hud, args):
+    def __init__(self, carla_world, hud, args, fusion_server=None):
         """Constructor method"""
         self._args = args
         self.world = carla_world
@@ -140,6 +142,7 @@ class World(object):
         self._weather_index = 0
         self._actor_filter = args.filter
         self._actor_generation = args.generation
+        self.fusion_server = fusion_server # Store fusion server
         self.restart(args)
         self.world.on_tick(hud.on_world_tick)
         self.recording_enabled = False
@@ -189,7 +192,7 @@ class World(object):
         self.collision_sensor = CollisionSensor(self.player, self.hud)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
         self.gnss_sensor = GnssSensor(self.player)
-        self.camera_manager = CameraManager(self.player, self.hud)
+        self.camera_manager = CameraManager(self.player, self.hud, fusion_server=self.fusion_server)
         # self.camera_manager.transform_index = cam_pos_id
         self.camera_manager.set_sensor(cam_index, notify=False)
         actor_type = get_actor_display_name(self.player)
@@ -596,12 +599,13 @@ class GnssSensor(object):
 class CameraManager(object):
     """ Class for camera management"""
 
-    def __init__(self, parent_actor, hud):
+    def __init__(self, parent_actor, hud, fusion_server=None):
         """Constructor method"""
         self.sensor = None
         self.surface = None
         self._parent = parent_actor
         self.hud = hud
+        self.fusion_server = fusion_server
         self.recording = False
         bound_x = 0.5 + self._parent.bounding_box.extent.x
         bound_y = 0.5 + self._parent.bounding_box.extent.y
@@ -618,23 +622,26 @@ class CameraManager(object):
         # self.transform_index = 1
         self.sensors = [
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB'],
-            # ['sensor.camera.depth', cc.Raw, 'Camera Depth (Raw)'],
-            # ['sensor.camera.depth', cc.Depth, 'Camera Depth (Gray Scale)'],
-            # ['sensor.camera.depth', cc.LogarithmicDepth, 'Camera Depth (Logarithmic Gray Scale)'],
-            # ['sensor.camera.semantic_segmentation', cc.Raw, 'Camera Semantic Segmentation (Raw)'],
-            # ['sensor.camera.semantic_segmentation', cc.CityScapesPalette,
-            #  'Camera Semantic Segmentation (CityScapes Palette)'],
-            # ['sensor.lidar.ray_cast', None, 'Lidar (Ray-Cast)'],
+            ['sensor.lidar.ray_cast_semantic', None, 'Lidar (Semantic Ray-Cast)'],
+            ['virtual_bev_map', None, 'Occupancy Grid Map']
             ]
         world = self._parent.get_world()
         bp_library = world.get_blueprint_library()
         for item in self.sensors:
+            if item[0] == 'virtual_bev_map':
+                item.append(None)
+                continue
             blp = bp_library.find(item[0])
             if item[0].startswith('sensor.camera'):
                 blp.set_attribute('image_size_x', str(hud.dim[0]))
                 blp.set_attribute('image_size_y', str(hud.dim[1]))
             elif item[0].startswith('sensor.lidar'):
                 blp.set_attribute('range', '50')
+                blp.set_attribute('rotation_frequency', '20')
+                blp.set_attribute('channels', '32')
+                blp.set_attribute('points_per_second', '100000')
+                blp.set_attribute('upper_fov', '15.0')
+                blp.set_attribute('lower_fov', '-25.0')
             item.append(blp)
         self.index = None # Sensor index
 
@@ -684,7 +691,7 @@ class CameraManager(object):
 
     def toggle_camera(self):
         """Activate a camera"""
-        self.index = (self.index + 1) % len(self._camera_transforms)
+        self.index = (self.index + 1) % len(self.sensors)
         self.set_sensor(self.index, notify=False, force_respawn=True)
 
     def set_sensor(self, index, notify=True, force_respawn=False):
@@ -695,16 +702,22 @@ class CameraManager(object):
             if self.sensor is not None:
                 self.sensor.destroy()
                 self.surface = None
-            self.sensor = self._parent.get_world().spawn_actor(
-                self.sensors[index][-1],
-                self._camera_transforms[index][0],
-                attach_to=self._parent,
-                attachment_type=self._camera_transforms[index][1])
 
-            # We need to pass the lambda a weak reference to
-            # self to avoid circular reference.
-            weak_self = weakref.ref(self)
-            self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
+            if self.sensors[index][0] == 'virtual_bev_map':
+                self.sensor = None
+            else:
+                # Use default transform (0) or decouple transform selection
+                transform_idx = 0 
+                self.sensor = self._parent.get_world().spawn_actor(
+                    self.sensors[index][-1],
+                    self._camera_transforms[transform_idx][0],
+                    attach_to=self._parent,
+                    attachment_type=self._camera_transforms[transform_idx][1])
+                
+                # We need to pass the lambda a weak reference to
+                # self to avoid circular reference.
+                weak_self = weakref.ref(self)
+                self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
         if notify:
             self.hud.notification(self.sensors[index][2])
         self.index = index
@@ -722,6 +735,10 @@ class CameraManager(object):
         """Render method"""
         if self.surface is not None:
             display.blit(self.surface, (0, 0))
+        
+        # Render Virtual BEV if active
+        if self.index is not None and self.sensors[self.index][0] == 'virtual_bev_map' and self.fusion_server:
+             self.render_virtual_bev(display)
     
     def get_gt_pose(self):
         '''Get camera pose from blueprint at current timestamp
@@ -745,6 +762,56 @@ class CameraManager(object):
         qw, qx, qy, qz = quat[3], quat[0], quat[1], quat[2]
         
         self.gt_trajectories.append(np.array([gt_loc.x, gt_loc.y, gt_loc.z, qw, qx, qy, qz]).reshape((7,1)))
+
+    def render_virtual_bev(self, display):
+        """Renders the global map from FusionServer to the main display"""
+        global_map = self.fusion_server.get_global_map()
+        if global_map is None:
+            return
+
+        # 1. Prepare Map Surface
+        h, w = global_map.shape
+        rgb_map = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        # Colors
+        rgb_map[(global_map > 0.45) & (global_map < 0.55)] = [50, 50, 50] # Unknown
+        rgb_map[global_map <= 0.45] = [0, 0, 0] # Free
+        rgb_map[global_map >= 0.55] = [255, 255, 255] # Occupied
+        
+        surf_array = rgb_map.swapaxes(0, 1)
+        temp_surf = pygame.surfarray.make_surface(surf_array)
+        
+        # Scale to fit screen height
+        scale = self.hud.dim[1] / self.fusion_server.grid_dim
+        map_w = int(self.fusion_server.grid_dim * scale)
+        map_h = int(self.fusion_server.grid_dim * scale)
+        
+        offset_x = (self.hud.dim[0] - map_w) // 2
+        offset_y = 0
+        
+        scaled_surf = pygame.transform.scale(temp_surf, (map_w, map_h))
+        display.blit(scaled_surf, (offset_x, offset_y))
+        
+        # 2. Draw Agent
+        # Access player from parent
+        actor = self._parent
+        t = actor.get_transform()
+        
+        def to_screen(gx, gy):
+            r = (self.fusion_server.max_x - gx) / self.fusion_server.grid_size
+            c = (gy - self.fusion_server.min_y) / self.fusion_server.grid_size
+            sx = offset_x + int(c * scale)
+            sy = offset_y + int(r * scale)
+            return sx, sy
+            
+        sx, sy = to_screen(t.location.x, t.location.y)
+        pygame.draw.circle(display, (0, 255, 0), (sx, sy), 8)
+        
+        # Heading
+        rad = math.radians(t.rotation.yaw)
+        dx = math.sin(rad) * 20
+        dy = -math.cos(rad) * 20
+        pygame.draw.line(display, (255, 0, 0), (sx, sy), (sx + dx, sy + dy), 3)
     
     def get_rel_pose(self):
         # TESTING:
@@ -867,9 +934,8 @@ def game_loop(args):
             random.seed(args.seed)
 
         client = carla.Client(args.host, args.port)
-        client.set_timeout(60.0)
+        client.set_timeout(20.0)
 
-        traffic_manager = client.get_trafficmanager()
         sim_world = client.get_world()
 
         if args.sync:
@@ -878,14 +944,19 @@ def game_loop(args):
             settings.fixed_delta_seconds = 0.05
             sim_world.apply_settings(settings)
 
+            traffic_manager = client.get_trafficmanager()
             traffic_manager.set_synchronous_mode(True)
-
+        
         display = pygame.display.set_mode(
             (args.width, args.height),
             pygame.HWSURFACE | pygame.DOUBLEBUF)
 
         hud = HUD(args.width, args.height)
-        world = World(client.get_world(), hud, args)
+        
+        # Initialize Fusion Server
+        fusion_server = FusionServer(map_dim=1000)
+        
+        world = World(client.get_world(), hud, args, fusion_server=fusion_server)
         controller = KeyboardControl(world)
         if args.agent == "Basic":
             agent = BasicAgent(world.player, 30)
@@ -896,9 +967,13 @@ def game_loop(args):
             if ground_loc:
                 world.player.set_location(ground_loc.location + carla.Location(z=0.01))
             agent.follow_speed_limits(True)
-        elif args.agent == "Behavior":
-            agent = BehaviorAgent(world.player, behavior=args.behavior)
-        
+        if args.agent == "Behavior":
+            agent = BehaviorAgent(world.player, behavior=args.behavior, fusion_server=fusion_server)
+            
+            # Use AgentWrapper to spawn all agent logic sensors (Lidar, Odometry, etc.)
+            agent_wrapper = AgentWrapper(agent, world.world)
+            agent_wrapper.setup_sensors(world.player, debug_mode=args.debug)
+
         world.camera_manager.add_sensor(agent.sensors())
 
         # Set the agent destination
@@ -965,7 +1040,9 @@ def game_loop(args):
             gt_traj = world.camera_manager.gt_trajectories
             est_traj = world.camera_manager.est_trajectories
             world.destroy()
-            agent.destroy(gt_traj, est_traj)
+            # agent.destroy(gt_traj, est_traj)
+            if agent:
+                 agent.destroy(gt_traj, est_traj)
 
         pygame.quit()
 

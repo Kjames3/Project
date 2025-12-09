@@ -276,6 +276,10 @@ class LocalPlanner(object):
 
         # Get the target waypoint and move using the PID controllers. Stop if no target waypoint
         if len(self._waypoints_queue) == 0:
+            if debug or self._stop_waypoint_creation: # Only print if meaningful
+                 pass # Too noisy if constantly empty?
+            # Actually, if we are stopping, let's print once
+            print(f"Agent {self._vehicle.id}: Local Planner queue empty! Stopping.")
             control = carla.VehicleControl()
             control.steer = 0.0
             control.throttle = 0.0
