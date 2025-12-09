@@ -12,6 +12,7 @@ Local Mapping Module for Occupancy Grid Generation
 import numpy as np
 import cv2
 from numba import njit
+import math
 
 @njit(fastmath=True)
 def voxel_filter(points, voxel_size):
@@ -62,6 +63,56 @@ def fast_raycast(grid, center_r, center_c, end_r, end_c):
                 err += dx
                 c0 += sy
 
+def get_matrix(transform):
+    """
+    Creates a 4x4 matrix from a CARLA-like Transform object.
+    Supports objects with .location (x,y,z) and .rotation (pitch,yaw,roll).
+    """
+    if hasattr(transform, 'get_matrix'):
+        # If it has get_matrix (CARLA object), use it but convert to numpy
+        return np.array(transform.get_matrix())
+
+    # Manual construction
+    x = transform.location.x
+    y = transform.location.y
+    z = transform.location.z
+
+    yaw = math.radians(transform.rotation.yaw)
+    pitch = math.radians(transform.rotation.pitch)
+    roll = math.radians(transform.rotation.roll)
+
+    # Rotation Matrix (Yaw * Pitch * Roll) - Standard CARLA (Unreal) convention
+    # But usually we just need Yaw for 2D, but let's do full.
+    # CR = cos(roll), SR = sin(roll), etc.
+    cy = math.cos(yaw)
+    sy = math.sin(yaw)
+    cp = math.cos(pitch)
+    sp = math.sin(pitch)
+    cr = math.cos(roll)
+    sr = math.sin(roll)
+
+    matrix = np.identity(4)
+
+    # Rotation
+    matrix[0, 0] = cp * cy
+    matrix[0, 1] = cy * sp * sr - sy * cr
+    matrix[0, 2] = -cy * sp * cr - sy * sr
+
+    matrix[1, 0] = cp * sy
+    matrix[1, 1] = sy * sp * sr + cy * cr
+    matrix[1, 2] = -sy * sp * cr + cy * sr
+
+    matrix[2, 0] = sp
+    matrix[2, 1] = -cp * sr
+    matrix[2, 2] = cp * cr
+
+    # Translation
+    matrix[0, 3] = x
+    matrix[1, 3] = y
+    matrix[2, 3] = z
+
+    return matrix
+
 class LocalMapper(object):
     """
     LocalMapper processes Semantic LiDAR data to generate a 2D local occupancy grid.
@@ -107,6 +158,36 @@ class LocalMapper(object):
 
         points = np.column_stack((data['x'], data['y'], data['z']))
         tags = data['tag']
+
+        # --- NEW: SENSOR TO VEHICLE TRANSFORM ---
+        # Points are in Sensor Frame. Transform to Vehicle Frame.
+        if hasattr(lidar_data, 'transform') and vehicle_transform is not None:
+            try:
+                # 1. Get Matrices
+                sensor_matrix = get_matrix(lidar_data.transform)
+                vehicle_matrix = get_matrix(vehicle_transform)
+
+                # 2. Compute Sensor -> Vehicle Transform
+                # T_sensor_local = inv(T_vehicle_global) * T_sensor_global
+                # Assuming vehicle_matrix is standard 4x4, we can invert it.
+                vehicle_inv = np.linalg.inv(vehicle_matrix)
+                rel_transform = np.dot(vehicle_inv, sensor_matrix)
+
+                # 3. Apply Transform to Points
+                # Points: (N, 3). Add homogeneous 1.
+                num_points = points.shape[0]
+                points_hom = np.hstack((points, np.ones((num_points, 1))))
+
+                # Transformed = (M_rel @ P_hom.T).T
+                # Optimization: P_transformed = P @ M_rel[:3,:3].T + M_rel[:3,3]
+                R_rel = rel_transform[:3, :3]
+                T_rel = rel_transform[:3, 3]
+
+                points = np.dot(points, R_rel.T) + T_rel
+
+            except Exception as e:
+                print(f"LocalMapper Error: Failed to transform points: {e}")
+        # ----------------------------------------
 
         # --- NEW: DOWNSAMPLING STEP ---
         # Quantize points to 10cm voxels
