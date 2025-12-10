@@ -16,7 +16,7 @@ from numba import jit
 @jit(nopython=True)
 def fast_fusion_update(log_odds_map, local_indices_r, local_indices_c, 
                       gx, gy, gyaw, grid_size, max_x, min_y, grid_dim, 
-                      local_center, update_val):
+                      local_center, update_val, min_val, max_val):
     
     cos_a = np.cos(gyaw)
     sin_a = np.sin(gyaw)
@@ -39,7 +39,12 @@ def fast_fusion_update(log_odds_map, local_indices_r, local_indices_c,
         
         # Boundary Check
         if 0 <= global_r < grid_dim and 0 <= global_c < grid_dim:
-            log_odds_map[global_r, global_c] += update_val
+            new_val = log_odds_map[global_r, global_c] + update_val
+            if new_val > max_val:
+                new_val = max_val
+            elif new_val < min_val:
+                new_val = min_val
+            log_odds_map[global_r, global_c] = new_val
 
 class FusionServer(object):
     """
@@ -107,7 +112,7 @@ class FusionServer(object):
             fast_fusion_update(self.log_odds_map, free_indices[0], free_indices[1], 
                                pose[0], pose[1], np.radians(pose[2]), self.grid_size, 
                                self.max_x, self.min_y, self.grid_dim, 
-                               local_center, self.l_free)
+                               local_center, self.l_free, self.l_min, self.l_max)
             updated = True
                            
         # Process Occupied
@@ -115,7 +120,7 @@ class FusionServer(object):
             fast_fusion_update(self.log_odds_map, occ_indices[0], occ_indices[1], 
                                pose[0], pose[1], np.radians(pose[2]), self.grid_size, 
                                self.max_x, self.min_y, self.grid_dim, 
-                               local_center, self.l_occ)
+                               local_center, self.l_occ, self.l_min, self.l_max)
             updated = True
         
         if updated:
@@ -217,15 +222,11 @@ class FusionServer(object):
         
         resized = cv2.resize(rgb_map, (height, width), interpolation=cv2.INTER_NEAREST)
         # resized shape is (width, height, 3).
-        
-        # Wait, if we want (Width, Height, 3).
-        # cv2.resize(src, (height, width)).
-        # Dsize is (cols, rows) -> (height, width).
-        # Result cols=height, rows=width.
-        # Shape (width, height, 3).
-        # Yes.
-        
-        return resized
+        # We need to swap axes because Pygame expects (Width, Height) where Width corresponds to Screen X.
+        # to_screen maps Screen X -> Global Y (Cols).
+        # resized indices are [Row (Global X), Col (Global Y)].
+        # So we want [Col, Row].
+        return resized.swapaxes(0, 1)
 
     def calculate_coverage(self):
         """Calculates mapped area in square meters"""

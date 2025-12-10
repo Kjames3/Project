@@ -110,12 +110,9 @@ class BehaviorAgent(BasicAgent):
         self._recovery_state = None
         self._recovery_counter = 0
 
-        # Fusion
-        if fusion_server:
-            from hybrid_planner import HybridRoutePlanner
-            # from mapping.occupancy_grid import LocalMapper # Moved below
-            self._hybrid_planner = HybridRoutePlanner(fusion_server, self._map)
-            # ... (rest of fusion init)
+        # Fusion -- Removed duplicate/incorrect init
+        # Correct init is lower down
+
         
         # We need LocalMapper regardless for run_step processing
         from mapping.occupancy_grid import LocalMapper
