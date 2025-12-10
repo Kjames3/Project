@@ -91,7 +91,10 @@ class HybridLateralController():
         
         # 1. Check if we are in a Junction
         # We use the first few waypoints to detect if we are turning at an intersection
-        is_junction = waypoints[0][0].is_junction
+        if waypoints:
+            is_junction = waypoints[0][0].is_junction
+        else:
+            return 0.0
 
         # 2. Select Strategy
         if is_junction:

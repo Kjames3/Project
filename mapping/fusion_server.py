@@ -215,7 +215,8 @@ class FusionServer(object):
         # We resize to (TargetH, TargetW).
         # Then transpose to (TargetW, TargetH, C) for Pygame.
 
-        resized = cv2.resize(rgb_map, (height, width), interpolation=cv2.INTER_NEAREST)
+        # Use rgb_map_t instead of rgb_map to ensure correct orientation
+        resized = cv2.resize(rgb_map_t, (height, width), interpolation=cv2.INTER_NEAREST)
         # resized shape is (width, height, 3).
 
         # Wait, if we want (Width, Height, 3).

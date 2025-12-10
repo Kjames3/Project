@@ -125,7 +125,7 @@ class TestOptimizations(unittest.TestCase):
         
         # Case 1: Straight Road (Stanley)
         # Waypoint at (10, 2), Yaw 0. Not junction.
-        wp_straight = MockWaypoint(10, 2, 0, is_junction=False)
+        wp_straight = carla.Waypoint(10, 2, 0, is_junction=False)
         waypoints_straight = deque([(wp_straight, None)])
         
         steer_straight = controller.run_step(waypoints_straight)
@@ -136,8 +136,11 @@ class TestOptimizations(unittest.TestCase):
 
         # Case 2: Junction (Pure Pursuit)
         # Waypoint at (10, 2). is_junction=True.
-        wp_junction = MockWaypoint(10, 2, 0, is_junction=True)
-        waypoints_junction = deque([(wp_junction, None)])
+        # Ensure it's far enough for lookahead (> 3.0m)
+        wp_junction = carla.Waypoint(10, 2, 0, is_junction=True)
+        # Add another waypoint further away to satisfy lookahead distance check
+        wp_far = carla.Waypoint(20, 4, 0, is_junction=True)
+        waypoints_junction = deque([(wp_junction, None), (wp_far, None)])
         
         steer_junction = controller.run_step(waypoints_junction)
         print(f"Junction/PP Steer: {steer_junction:.3f}")
