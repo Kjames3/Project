@@ -60,11 +60,19 @@ def get_matrix(transform):
     if hasattr(transform, 'get_matrix'):
         # If it has get_matrix (CARLA object), use it but convert to numpy
         return np.array(transform.get_matrix())
+
     
     # Manual construction
     x = transform.location.x
     y = transform.location.y
     z = transform.location.z
+
+2 changes: 1 addition & 1 deletion 2
+agents/navigation/behavior_agent.py
+Viewed
+Original file line number 	Diff line number 	Diff line change
+
+
     
     yaw = math.radians(transform.rotation.yaw)
     pitch = math.radians(transform.rotation.pitch)

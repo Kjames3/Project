@@ -933,9 +933,15 @@ class CameraManager(object):
             lidar_data = np.array(points[:, :2])
             lidar_data *= min(self.hud.dim) / 100.0
             lidar_data += (0.5 * self.hud.dim[0], 0.5 * self.hud.dim[1])
-            lidar_data = np.fabs(lidar_data)  # pylint: disable=E1111
+            # lidar_data = np.fabs(lidar_data)  # pylint: disable=E1111
             lidar_data = lidar_data.astype(np.int32)
             lidar_data = np.reshape(lidar_data, (-1, 2))
+            # Clip data to be within image bounds
+            lidar_data_t = lidar_data.T
+            lidar_data_t[0] = np.clip(lidar_data_t[0], 0, self.hud.dim[0] - 1)
+            lidar_data_t[1] = np.clip(lidar_data_t[1], 0, self.hud.dim[1] - 1)
+            lidar_data = lidar_data_t.T
+
             lidar_img_size = (self.hud.dim[0], self.hud.dim[1], 3)
             lidar_img = np.zeros(lidar_img_size)
             lidar_img[tuple(lidar_data.T)] = (255, 255, 255)

@@ -97,20 +97,20 @@ class TestNavigation(unittest.TestCase):
         agent._stuck_timer = 0
         
         # Update stuck status (no movement)
-        agent._update_stuck_status()
+        agent._update_stuck_status(hazard_detected=True)
         self.assertEqual(agent._stuck_timer, 1)
         
         # Update again
-        agent._update_stuck_status()
+        agent._update_stuck_status(hazard_detected=True)
         self.assertEqual(agent._stuck_timer, 2)
         
         # Simulate movement
         vehicle.get_location.return_value = mock_carla.Location(10, 0, 0)
-        agent._update_stuck_status()
+        agent._update_stuck_status(hazard_detected=True)
         self.assertEqual(agent._stuck_timer, 0)
         
         # Simulate stuck threshold
-        agent._stuck_timer = 101
+        agent._stuck_timer = 401
         self.assertTrue(agent.is_stuck())
         
         print("TestNavigation Stuck Detection Passed")

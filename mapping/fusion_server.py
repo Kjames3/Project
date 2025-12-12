@@ -39,6 +39,7 @@ def fast_fusion_update(log_odds_map, local_indices_r, local_indices_c,
         
         # Boundary Check
         if 0 <= global_r < grid_dim and 0 <= global_c < grid_dim:
+            log_odds_map[global_r, global_c] += update_val
             new_val = log_odds_map[global_r, global_c] + update_val
             if new_val > max_val:
                 new_val = max_val
@@ -73,6 +74,7 @@ class FusionServer(object):
         # Caching
         self._cached_prob_map = None
         self._map_dirty = True
+
         
         # Constants for Log-Odds
         self.l_occ = np.log(0.7 / 0.3)  # p(occ) = 0.7
@@ -106,12 +108,14 @@ class FusionServer(object):
         occ_indices = np.where(local_occupancy_grid > 0.55)
         
         updated = False
+
         
         # Process Free
         if len(free_indices[0]) > 0:
             fast_fusion_update(self.log_odds_map, free_indices[0], free_indices[1], 
                                pose[0], pose[1], np.radians(pose[2]), self.grid_size, 
                                self.max_x, self.min_y, self.grid_dim, 
+                               local_center, self.l_free)
                                local_center, self.l_free, self.l_min, self.l_max)
             updated = True
                            
@@ -120,6 +124,9 @@ class FusionServer(object):
             fast_fusion_update(self.log_odds_map, occ_indices[0], occ_indices[1], 
                                pose[0], pose[1], np.radians(pose[2]), self.grid_size, 
                                self.max_x, self.min_y, self.grid_dim, 
+                               local_center, self.l_occ)
+            updated = True
+
                                local_center, self.l_occ, self.l_min, self.l_max)
             updated = True
         
@@ -167,6 +174,11 @@ class FusionServer(object):
         """
         # Optimized: Use pre-computed probability map and vectorized ops
         probs = self.get_global_map()
+
+        # 1. Generate full-res RGB map
+        # Note: We allocate new array, but it's faster than per-pixel exp in python loop
+        rgb_map = np.zeros((self.grid_dim, self.grid_dim, 3), dtype=np.uint8)
+
         
         # 1. Generate full-res RGB map
         # Note: We allocate new array, but it's faster than per-pixel exp in python loop
@@ -179,12 +191,14 @@ class FusionServer(object):
         rgb_map[probs <= 0.45] = [0, 0, 0]
         # Occupied (>= 0.55) -> White
         rgb_map[probs >= 0.55] = [255, 255, 255]
+
         
         # 2. Resize to target size
         # Use cv2 if available (much faster than manual or pygame usually)
         # But we must match (Width, Height) format.
         # rgb_map is (Rows, Cols, 3) -> (Height, Width, 3).
         # cv2.resize expects (dest_width, dest_height).
+
         
         # Swap axes to match Pygame logic (Width, Height) if needed?
         # Original code:
@@ -193,6 +207,7 @@ class FusionServer(object):
         # for x in range(out_w): for y in range(out_h): mc = x*scale; mr = y*scale.
         # So output is (Width, Height).
         # We need to return (Width, Height, 3).
+
         
         # Input rgb_map is (GridH, GridW, 3).
         # We want Output (TargetW, TargetH, 3).
@@ -200,6 +215,10 @@ class FusionServer(object):
         # And target size (TargetW, TargetH).
         # Result is (TargetH, TargetW, C).
         # We need (TargetW, TargetH, C).
+
+        # So we transpose input to (GridW, GridH, 3).
+        rgb_map_t = rgb_map.transpose(1, 0, 2)
+
         
         # So we transpose input to (GridW, GridH, 3).
         rgb_map_t = rgb_map.transpose(1, 0, 2)
@@ -209,16 +228,31 @@ class FusionServer(object):
         # Src is (H, W, C).
         # Dsize is (TargetW, TargetH). (This sets columns, rows).
         # Result is (TargetH, TargetW, C).
+
         
         # If we want result (TargetW, TargetH, C):
         # We should pass Src (TargetW_source, TargetH_source, C).
         # Dsize (TargetH, TargetW).
         # Result (TargetW, TargetH, C).
+
         
         # Let's stick to standard image convention:
         # Image is (H, W, C).
         # We resize to (TargetH, TargetW).
         # Then transpose to (TargetW, TargetH, C) for Pygame.
+
+        # Use rgb_map_t instead of rgb_map to ensure correct orientation
+        resized = cv2.resize(rgb_map_t, (height, width), interpolation=cv2.INTER_NEAREST)
+        # resized shape is (width, height, 3).
+
+        # Wait, if we want (Width, Height, 3).
+        # cv2.resize(src, (height, width)).
+        # Dsize is (cols, rows) -> (height, width).
+        # Result cols=height, rows=width.
+        # Shape (width, height, 3).
+        # Yes.
+
+        return resized
         
         resized = cv2.resize(rgb_map, (height, width), interpolation=cv2.INTER_NEAREST)
         # resized shape is (width, height, 3).
