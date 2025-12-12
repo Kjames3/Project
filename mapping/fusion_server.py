@@ -16,7 +16,7 @@ from numba import jit
 @jit(nopython=True)
 def fast_fusion_update(log_odds_map, local_indices_r, local_indices_c, 
                       gx, gy, gyaw, grid_size, max_x, min_y, grid_dim, 
-                      local_center, update_val):
+                      local_center, update_val, min_val, max_val):
     
     cos_a = np.cos(gyaw)
     sin_a = np.sin(gyaw)
@@ -40,6 +40,12 @@ def fast_fusion_update(log_odds_map, local_indices_r, local_indices_c,
         # Boundary Check
         if 0 <= global_r < grid_dim and 0 <= global_c < grid_dim:
             log_odds_map[global_r, global_c] += update_val
+            new_val = log_odds_map[global_r, global_c] + update_val
+            if new_val > max_val:
+                new_val = max_val
+            elif new_val < min_val:
+                new_val = min_val
+            log_odds_map[global_r, global_c] = new_val
 
 class FusionServer(object):
     """
@@ -69,6 +75,7 @@ class FusionServer(object):
         self._cached_prob_map = None
         self._map_dirty = True
 
+        
         # Constants for Log-Odds
         self.l_occ = np.log(0.7 / 0.3)  # p(occ) = 0.7
         self.l_free = np.log(0.4 / 0.6) # p(free) = 0.4
@@ -102,12 +109,14 @@ class FusionServer(object):
         
         updated = False
 
+        
         # Process Free
         if len(free_indices[0]) > 0:
             fast_fusion_update(self.log_odds_map, free_indices[0], free_indices[1], 
                                pose[0], pose[1], np.radians(pose[2]), self.grid_size, 
                                self.max_x, self.min_y, self.grid_dim, 
                                local_center, self.l_free)
+                               local_center, self.l_free, self.l_min, self.l_max)
             updated = True
                            
         # Process Occupied
@@ -118,6 +127,9 @@ class FusionServer(object):
                                local_center, self.l_occ)
             updated = True
 
+                               local_center, self.l_occ, self.l_min, self.l_max)
+            updated = True
+        
         if updated:
             self._map_dirty = True
 
@@ -152,7 +164,7 @@ class FusionServer(object):
         if self._map_dirty or self._cached_prob_map is None:
             self._cached_prob_map = 1.0 / (1.0 + np.exp(-self.log_odds_map))
             self._map_dirty = False
-
+            
         return self._cached_prob_map
         
     def get_map_image(self, width, height):
@@ -167,6 +179,11 @@ class FusionServer(object):
         # Note: We allocate new array, but it's faster than per-pixel exp in python loop
         rgb_map = np.zeros((self.grid_dim, self.grid_dim, 3), dtype=np.uint8)
 
+        
+        # 1. Generate full-res RGB map
+        # Note: We allocate new array, but it's faster than per-pixel exp in python loop
+        rgb_map = np.zeros((self.grid_dim, self.grid_dim, 3), dtype=np.uint8)
+        
         # Colors
         # Unknown (0.45 - 0.55) -> Gray
         rgb_map[(probs > 0.45) & (probs < 0.55)] = [50, 50, 50]
@@ -175,12 +192,14 @@ class FusionServer(object):
         # Occupied (>= 0.55) -> White
         rgb_map[probs >= 0.55] = [255, 255, 255]
 
+        
         # 2. Resize to target size
         # Use cv2 if available (much faster than manual or pygame usually)
         # But we must match (Width, Height) format.
         # rgb_map is (Rows, Cols, 3) -> (Height, Width, 3).
         # cv2.resize expects (dest_width, dest_height).
 
+        
         # Swap axes to match Pygame logic (Width, Height) if needed?
         # Original code:
         # out_w, out_h = output_image.shape
@@ -189,6 +208,7 @@ class FusionServer(object):
         # So output is (Width, Height).
         # We need to return (Width, Height, 3).
 
+        
         # Input rgb_map is (GridH, GridW, 3).
         # We want Output (TargetW, TargetH, 3).
         # But cv2.resize takes image (H, W, C).
@@ -199,17 +219,23 @@ class FusionServer(object):
         # So we transpose input to (GridW, GridH, 3).
         rgb_map_t = rgb_map.transpose(1, 0, 2)
 
+        
+        # So we transpose input to (GridW, GridH, 3).
+        rgb_map_t = rgb_map.transpose(1, 0, 2)
+        
         # Resize to (TargetH, TargetW) -> resulting shape (TargetW, TargetH, 3)?
         # No, cv2.resize(src, dsize=(width, height)).
         # Src is (H, W, C).
         # Dsize is (TargetW, TargetH). (This sets columns, rows).
         # Result is (TargetH, TargetW, C).
 
+        
         # If we want result (TargetW, TargetH, C):
         # We should pass Src (TargetW_source, TargetH_source, C).
         # Dsize (TargetH, TargetW).
         # Result (TargetW, TargetH, C).
 
+        
         # Let's stick to standard image convention:
         # Image is (H, W, C).
         # We resize to (TargetH, TargetW).
@@ -227,6 +253,14 @@ class FusionServer(object):
         # Yes.
 
         return resized
+        
+        resized = cv2.resize(rgb_map, (height, width), interpolation=cv2.INTER_NEAREST)
+        # resized shape is (width, height, 3).
+        # We need to swap axes because Pygame expects (Width, Height) where Width corresponds to Screen X.
+        # to_screen maps Screen X -> Global Y (Cols).
+        # resized indices are [Row (Global X), Col (Global Y)].
+        # So we want [Col, Row].
+        return resized.swapaxes(0, 1)
 
     def calculate_coverage(self):
         """Calculates mapped area in square meters"""

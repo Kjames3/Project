@@ -983,7 +983,7 @@ def game_loop(args):
 
         hud = HUD(args.width, args.height)
         # Initialize Fusion Server
-        fusion_server = FusionServer(map_dim=1000)
+        fusion_server = FusionServer(grid_size=0.5, map_dim=1000)
 
         world = World(client.get_world(), hud, args, fusion_server=fusion_server)
         controller = KeyboardControl(world)
